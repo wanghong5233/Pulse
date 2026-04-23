@@ -1,13 +1,25 @@
+"""Recall memory —— 中期对话与工具调用记忆。
+
+检索路径为 **agentic search**：
+- `recent(...)`: 按 scope (session/task/workspace) 拉最近 N 条；
+- `search_keyword(...)`: 对 text 字段做 PG ILIKE 匹配，由 Brain 侧生成多组关键词串联查询。
+
+内核不自带语义召回。关于这一决策，参见
+`docs/Pulse-MemoryRuntime设计.md` 附录 B: Retrieval 策略抉择。
+"""
+
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from ..storage.engine import DatabaseEngine
-from ..storage.vector import LocalVectorStore
 from .envelope import MemoryEnvelope, MemoryKind
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now_iso() -> str:
@@ -15,6 +27,11 @@ def _utc_now_iso() -> str:
 
 
 def _parse_metadata(raw: Any) -> dict[str, Any]:
+    """DB 里 metadata 列可能是 JSON 文本 / dict / NULL, 这里统一成 dict.
+
+    解析失败 = **schema 漂移**或**上游写入 bug**, 不是业务异常 — 记 debug 日志
+    便于排查, 但不 raise (单条记录坏不该导致整个 recall 列表抓取失败).
+    """
     if isinstance(raw, dict):
         return dict(raw)
     if isinstance(raw, str):
@@ -23,29 +40,28 @@ def _parse_metadata(raw: Any) -> dict[str, Any]:
             return {}
         try:
             parsed = json.loads(text)
-        except Exception:
+        except json.JSONDecodeError as exc:
+            logger.debug(
+                "recall_memory: metadata JSON decode failed (skipping): %s; raw=%r",
+                exc, text[:120],
+            )
             return {}
         return dict(parsed) if isinstance(parsed, dict) else {}
     return {}
 
 
 class RecallMemory:
-    """Recall memory backed by PostgreSQL + Chroma."""
+    """PostgreSQL-backed recall memory (agentic search, no vector)."""
 
     def __init__(
         self,
         *,
         storage_path: str | None = None,
-        collection_name: str = "pulse_recall_memory",
         db_engine: DatabaseEngine | None = None,
-        vector_store: LocalVectorStore | None = None,
     ) -> None:
         _ = storage_path
-        self._collection_name = str(collection_name or "pulse_recall_memory").strip()
         self._db = db_engine or DatabaseEngine()
-        self._store = vector_store or LocalVectorStore()
         self._ensure_schema()
-        self._bootstrap_vector_index()
 
     def _ensure_schema(self) -> None:
         self._db.execute(
@@ -102,38 +118,6 @@ class RecallMemory:
                     f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} TEXT"  # noqa: S608
                 )
 
-    def _bootstrap_vector_index(self) -> None:
-        if self._store.collection_count(collection=self._collection_name) > 0:
-            return
-        rows = self._db.execute(
-            """
-            SELECT id, role, text, metadata_json, session_id, created_at
-            FROM conversations
-            ORDER BY created_at ASC
-            """,
-            fetch="all",
-        ) or []
-        upsert_rows: list[dict[str, Any]] = []
-        for row in rows:
-            row_id, role, text, metadata_raw, session_id, created_at = row
-            metadata = _parse_metadata(metadata_raw)
-            metadata.update(
-                {
-                    "role": str(role or ""),
-                    "session_id": str(session_id or ""),
-                    "timestamp": str(created_at.isoformat() if hasattr(created_at, "isoformat") else created_at or ""),
-                }
-            )
-            upsert_rows.append(
-                {
-                    "id": str(row_id),
-                    "text": f"[{str(role or '')}] {str(text or '')}",
-                    "metadata": metadata,
-                }
-            )
-        if upsert_rows:
-            self._store.upsert_texts(collection=self._collection_name, rows=upsert_rows)
-
     def _insert_entry(
         self,
         *,
@@ -163,26 +147,6 @@ class RecallMemory:
                 workspace_id,
                 timestamp,
             ),
-        )
-        vec_metadata = {
-            **metadata,
-            "role": role,
-            "session_id": session_id,
-            "timestamp": timestamp,
-        }
-        if task_id:
-            vec_metadata["task_id"] = task_id
-        if run_id:
-            vec_metadata["run_id"] = run_id
-        self._store.upsert_texts(
-            collection=self._collection_name,
-            rows=[
-                {
-                    "id": entry_id,
-                    "text": f"[{role}] {text}",
-                    "metadata": vec_metadata,
-                }
-            ],
         )
         return {
             "id": entry_id,
@@ -254,12 +218,23 @@ class RecallMemory:
         task_id: str | None = None,
         workspace_id: str | None = None,
         role: str | None = None,
+        roles: "tuple[str, ...] | list[str] | None" = None,
     ) -> list[dict[str, Any]]:
+        """最近 N 条 conversation 记录 (倒序查询后正序返回).
+
+        ``roles`` 优先于 ``role``; 传 ``roles=("user","assistant")`` 用于
+        只拉"真实对话", 排除 ``store_envelope`` 写入的 role=system 的
+        task_summary 条目 (否则它们会被当成对话历史回灌给 LLM, 形成
+        递归嵌套 summary, 见 F11).
+        """
         safe_limit = max(1, min(int(limit), 200))
         safe_session = str(session_id or "").strip()
         safe_task = str(task_id or "").strip()
         safe_workspace = str(workspace_id or "").strip()
         safe_role = str(role or "").strip().lower()
+        safe_roles: tuple[str, ...] = tuple(
+            {str(r or "").strip().lower() for r in (roles or ()) if str(r or "").strip()}
+        )
 
         where: list[str] = []
         params: list[Any] = []
@@ -272,7 +247,13 @@ class RecallMemory:
         if safe_workspace:
             where.append("workspace_id = %s")
             params.append(safe_workspace)
-        if safe_role:
+        if safe_roles:
+            # role ∈ (...) — ANY(%s) 对 postgres text[] 也适用, 保持与
+            # DatabaseEngine 的 param 转义一致, 不手工拼 SQL.
+            placeholders = ",".join(["%s"] * len(safe_roles))
+            where.append(f"role IN ({placeholders})")
+            params.extend(safe_roles)
+        elif safe_role:
             where.append("role = %s")
             params.append(safe_role)
 
@@ -302,43 +283,86 @@ class RecallMemory:
             for row_id, entry_role, text, metadata_raw, entry_session, entry_task, entry_run, entry_workspace, created_at in rows
         ]
 
-    def search(
+    def search_keyword(
         self,
         *,
-        query: str,
+        keywords: list[str] | str,
         top_k: int = 5,
-        min_similarity: float = 0.0,
         session_id: str | None = None,
+        workspace_id: str | None = None,
+        role: str | None = None,
+        match: str = "any",
     ) -> list[dict[str, Any]]:
-        safe_query = str(query or "").strip()
-        if not safe_query:
+        """Agentic search：按关键词做 SQL ILIKE 匹配。
+
+        由 Brain（或上层模块）自行决定生成哪些关键词（同义词、改写、拆分），
+        内核只负责执行匹配。推荐用法：
+
+            hits = recall.search_keyword(
+                keywords=["字节", "笔试挂", "bytedance"],
+                match="any",
+                session_id=ctx.session_id,
+            )
+
+        参数：
+        - keywords: 单个或多个关键词，全部对 text 字段 ILIKE。
+        - match="any": 任一关键词命中即返回（OR）。
+        - match="all": 所有关键词都命中才返回（AND）。
+        """
+        if isinstance(keywords, str):
+            kw_list = [keywords]
+        else:
+            kw_list = [str(k).strip() for k in keywords if str(k or "").strip()]
+        if not kw_list:
             return []
-        safe_top_k = max(1, min(int(top_k), 30))
-        safe_min_similarity = max(0.0, min(float(min_similarity), 1.0))
-        safe_session = str(session_id or "").strip()
-        rows = self._store.query_texts(
-            collection=self._collection_name,
-            query=safe_query,
-            top_k=max(safe_top_k * 4, 12),
-            min_similarity=safe_min_similarity,
+
+        safe_top_k = max(1, min(int(top_k), 50))
+        match_mode = "all" if str(match).strip().lower() == "all" else "any"
+        joiner = " AND " if match_mode == "all" else " OR "
+
+        where_clauses: list[str] = []
+        params: list[Any] = []
+
+        kw_clauses: list[str] = []
+        for kw in kw_list:
+            kw_clauses.append("text ILIKE %s")
+            params.append(f"%{kw}%")
+        where_clauses.append("(" + joiner.join(kw_clauses) + ")")
+
+        if str(session_id or "").strip():
+            where_clauses.append("session_id = %s")
+            params.append(str(session_id).strip())
+        if str(workspace_id or "").strip():
+            where_clauses.append("workspace_id = %s")
+            params.append(str(workspace_id).strip())
+        if str(role or "").strip():
+            where_clauses.append("role = %s")
+            params.append(str(role).strip().lower())
+
+        sql = (
+            "SELECT id, role, text, metadata_json, session_id, task_id, run_id, workspace_id, created_at "
+            "FROM conversations WHERE " + " AND ".join(where_clauses)
+            + " ORDER BY created_at DESC LIMIT %s"
         )
+        params.append(safe_top_k)
+        rows = self._db.execute(sql, tuple(params), fetch="all") or []
+
         items: list[dict[str, Any]] = []
-        for row in rows:
-            metadata = dict(row.get("metadata") or {})
-            if safe_session and str(metadata.get("session_id") or "") != safe_session:
-                continue
+        for row_id, entry_role, text, metadata_raw, entry_session, entry_task, entry_run, entry_workspace, created_at in rows:
             items.append(
                 {
-                    "id": str(row.get("id") or ""),
-                    "role": str(metadata.get("role") or ""),
-                    "text": str(row.get("text") or ""),
-                    "timestamp": str(metadata.get("timestamp") or ""),
-                    "metadata": metadata,
-                    "similarity": float(row.get("similarity") or 0.0),
+                    "id": str(row_id),
+                    "role": str(entry_role or ""),
+                    "text": str(text or ""),
+                    "session_id": str(entry_session or ""),
+                    "task_id": str(entry_task or ""),
+                    "run_id": str(entry_run or ""),
+                    "workspace_id": str(entry_workspace or ""),
+                    "timestamp": str(created_at.isoformat() if hasattr(created_at, "isoformat") else created_at or ""),
+                    "metadata": _parse_metadata(metadata_raw),
+                    "matched_keywords": [kw for kw in kw_list if kw.lower() in str(text or "").lower()],
                 }
             )
-            if len(items) >= safe_top_k:
-                break
         return items
 
     def count(self) -> int:
@@ -367,7 +391,12 @@ class RecallMemory:
         if tool_result is not None:
             try:
                 result_json = json.dumps(tool_result, ensure_ascii=False, default=str)
-            except Exception:
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "recall_memory: tool_result not JSON-serializable, storing string "
+                    "preview tool=%s err=%s",
+                    tool_name, exc,
+                )
                 result_json = json.dumps({"_str": str(tool_result)[:2000]})
         self._db.execute(
             """

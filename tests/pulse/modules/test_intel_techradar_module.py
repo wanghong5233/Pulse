@@ -11,23 +11,23 @@ pytestmark = pytest.mark.usefixtures("postgres_test_db")
 def test_intel_techradar_collect_report_and_push_routes() -> None:
     app = create_app()
     with TestClient(app) as client:
-        health_resp = client.get("/api/modules/intel_techradar/health")
+        health_resp = client.get("/api/modules/intel/techradar/health")
         collect_resp = client.post(
-            "/api/modules/intel_techradar/collect",
+            "/api/modules/intel/techradar/collect",
             json={"keyword": "MCP", "max_items": 5, "source": "real"},
         )
         report_resp = client.get(
-            "/api/modules/intel_techradar/daily-report",
+            "/api/modules/intel/techradar/daily-report",
             params={"keyword": "MCP", "max_items": 4},
         )
         push_resp = client.post(
-            "/api/modules/intel_techradar/daily-push",
+            "/api/modules/intel/techradar/daily-push",
             json={"keyword": "MCP", "max_items": 4, "channel": "feishu"},
         )
-        schedule_status_resp = client.get("/api/modules/intel_techradar/schedule/status")
-        schedule_trigger_resp = client.post("/api/modules/intel_techradar/schedule/trigger")
-        schedule_start_resp = client.post("/api/modules/intel_techradar/schedule/start")
-        schedule_stop_resp = client.post("/api/modules/intel_techradar/schedule/stop")
+        schedule_status_resp = client.get("/api/modules/intel/techradar/schedule/status")
+        schedule_trigger_resp = client.post("/api/modules/intel/techradar/schedule/trigger")
+        schedule_start_resp = client.post("/api/modules/intel/techradar/schedule/start")
+        schedule_stop_resp = client.post("/api/modules/intel/techradar/schedule/stop")
 
     assert health_resp.status_code == 200
     assert health_resp.json()["status"] == "ok"

@@ -10,8 +10,9 @@ from pulse.core.learning import PreferenceExtractor
 from pulse.core.memory import CoreMemory, RecallMemory
 from pulse.core.memory.archival_memory import ArchivalMemory
 from pulse.core.soul import SoulEvolutionEngine, SoulGovernance
+from pulse.core.task_context import TaskContext
 from pulse.core.tool import ToolRegistry, tool
-from tests.pulse.support.fakes import FakeArchivalDB, FakeRecallDB, FakeVectorStore
+from tests.pulse.support.fakes import FakeArchivalDB, FakeRecallDB
 
 
 @tool(name="weather.current", description="mock weather tool")
@@ -30,8 +31,8 @@ def _alarm(args: dict[str, object]) -> dict[str, object]:
 
 
 class _FakePlannerLLMRouter:
-    def invoke_chat(self, messages, *, tools=None, route="default"):  # noqa: ANN001, ANN201
-        _ = tools, route
+    def invoke_chat(self, messages, *, tools=None, route="default", tool_choice=None):  # noqa: ANN001, ANN201
+        _ = tools, route, tool_choice
         full_text = "\n".join(str(getattr(message, "content", "")) for message in messages)
         tool_calls_seen = sum(1 for message in messages if getattr(message, "tool_call_id", None))
         query = str(getattr(messages[-1], "content", "")) if messages else ""
@@ -68,8 +69,8 @@ def test_brain_runs_explicit_tool_command() -> None:
     registry.register_callable(_weather)
     brain = Brain(tool_registry=registry, llm_router=None, cost_controller=CostController(daily_budget_usd=5.0))
 
-    result = asyncio.run(brain.run(query="/tool weather.current Beijing", prefer_llm=False))
-    assert result.stopped_reason == "responded"
+    result = asyncio.run(brain.run(query="/tool weather.current Beijing", ctx=TaskContext(), prefer_llm=False))
+    assert result.stopped_reason == "completed"
     assert "weather.current" in result.used_tools
     assert "temperature_c" in result.answer
 
@@ -86,8 +87,8 @@ def test_brain_runs_multi_tool_plan() -> None:
         max_steps=6,
     )
 
-    result = asyncio.run(brain.run(query="请先查天气再查航班并设提醒", prefer_llm=True))
-    assert result.stopped_reason == "responded"
+    result = asyncio.run(brain.run(query="请先查天气再查航班并设提醒", ctx=TaskContext(), prefer_llm=True))
+    assert result.stopped_reason == "completed"
     assert "weather.current" in result.used_tools
     assert "flight.search" in result.used_tools
     assert "alarm.create" in result.used_tools
@@ -97,7 +98,7 @@ def test_brain_runs_multi_tool_plan() -> None:
 def test_brain_returns_fallback_without_tool_hint() -> None:
     registry = ToolRegistry()
     brain = Brain(tool_registry=registry, llm_router=None)
-    result = asyncio.run(brain.run(query="hello", prefer_llm=False))
+    result = asyncio.run(brain.run(query="hello", ctx=TaskContext(), prefer_llm=False))
     assert result.stopped_reason == "no_llm"
     assert "tool" in result.answer.lower()
 
@@ -109,7 +110,7 @@ def test_brain_uses_memory_preference_and_writes_recall(tmp_path) -> None:
         storage_path=str(tmp_path / "core_memory.json"),
         soul_config_path=str(tmp_path / "soul.yaml"),
     )
-    recall_memory = RecallMemory(db_engine=FakeRecallDB(), vector_store=FakeVectorStore())
+    recall_memory = RecallMemory(db_engine=FakeRecallDB())
     brain = Brain(
         tool_registry=registry,
         llm_router=_FakePlannerLLMRouter(),
@@ -121,13 +122,13 @@ def test_brain_uses_memory_preference_and_writes_recall(tmp_path) -> None:
     core_memory.update_preferences({"default_location": "杭州"})
     assert core_memory.preference("default_location") == "杭州"
 
-    result = asyncio.run(brain.run(query="帮我查天气", prefer_llm=True))
-    assert result.stopped_reason == "responded"
+    result = asyncio.run(brain.run(query="帮我查天气", ctx=TaskContext(), prefer_llm=True))
+    assert result.stopped_reason == "completed"
     assert "杭州" in result.answer or "hangzhou" in result.answer.lower()
 
     recent = recall_memory.recent(limit=10)
     assert len(recent) >= 2
-    hits = recall_memory.search(query="查天气", top_k=3)
+    hits = recall_memory.search_keyword(keywords=["查天气"], top_k=3)
     assert len(hits) >= 1
 
 
@@ -138,9 +139,9 @@ def test_brain_reflection_updates_preference_for_followup(tmp_path) -> None:
         storage_path=str(tmp_path / "core_memory.json"),
         soul_config_path=str(tmp_path / "soul.yaml"),
     )
-    recall_memory = RecallMemory(db_engine=FakeRecallDB(), vector_store=FakeVectorStore())
+    recall_memory = RecallMemory(db_engine=FakeRecallDB())
     governance = SoulGovernance(core_memory=core_memory, audit_path=str(tmp_path / "audit.json"))
-    archival_memory = ArchivalMemory(db_engine=FakeArchivalDB(), vector_store=FakeVectorStore(hit_score=0.96, miss_score=0.35))
+    archival_memory = ArchivalMemory(db_engine=FakeArchivalDB())
     evolution = SoulEvolutionEngine(
         governance=governance,
         archival_memory=archival_memory,
@@ -162,6 +163,6 @@ def test_brain_reflection_updates_preference_for_followup(tmp_path) -> None:
     )
     assert core_memory.preference("default_location") == "上海"
 
-    result = asyncio.run(brain.run(query="帮我查天气", prefer_llm=True))
-    assert result.stopped_reason == "responded"
+    result = asyncio.run(brain.run(query="帮我查天气", ctx=TaskContext(), prefer_llm=True))
+    assert result.stopped_reason == "completed"
     assert "上海" in result.answer or "shanghai" in result.answer.lower()

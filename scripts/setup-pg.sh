@@ -6,7 +6,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DB_USER="${PULSE_PG_USER:-pulse}"
 DB_PASSWORD="${PULSE_PG_PASSWORD:-pulse}"
 DB_NAME="${PULSE_PG_DB:-pulse}"
-INIT_SQL="${PULSE_INIT_SQL:-$PROJECT_DIR/backend/sql/init_db.sql}"
+INIT_SQL="${PULSE_INIT_SQL:-$PROJECT_DIR/infra/sql/init_db.sql}"
 
 echo "=== Setting up PostgreSQL for Pulse ==="
 echo "user=$DB_USER db=$DB_NAME"
@@ -15,14 +15,16 @@ echo "user=$DB_USER db=$DB_NAME"
 sudo pg_ctlcluster 16 main start 2>/dev/null || true
 
 # Create user and database
+# 注意: bash heredoc 里 $$ 会被当成进程 PID 替换, 所以 PL/pgSQL 匿名块
+# 的 dollar-quoted string 用 $BODY$ 而不是默认的 $$。
 sudo -u postgres psql -v ON_ERROR_STOP=0 <<SQL
-DO $$
+DO \$BODY\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${DB_USER}') THEN
     CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD '${DB_PASSWORD}' CREATEDB;
   END IF;
 END
-$$;
+\$BODY\$;
 SQL
 
 sudo -u postgres psql -v ON_ERROR_STOP=0 <<SQL

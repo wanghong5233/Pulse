@@ -19,6 +19,44 @@ dependencies = [
   "pydantic-settings>=2.6.0",
   "langchain-core>=0.3.0",
   "langchain-openai>=0.2.0",
+  "pyyaml>=6.0",
+]
+
+# ─────────────────────────────────────────────────────────────────────
+# 可选依赖分组: 按 "只在启用某个能力时才需要" 的边界切开. 任何时候发现
+# 代码里新增了一个第三方 import, 请同步登记到对应分组, 禁止在 venv 里
+# 手工 pip install 后不写回 pyproject.toml —— 那会让别人换环境立刻穿帮
+# (真实案例: wecom-aibot-sdk-python 长期未登记, 换 WSL 新 venv 后 IM 直接哑火).
+# ─────────────────────────────────────────────────────────────────────
+[project.optional-dependencies]
+# 存储层 (RecallMemory/ArchivalMemory/WorkspaceMemory 依赖 PostgreSQL)
+db = [
+  "psycopg[binary]>=3.1",
+]
+
+# 企业微信 AI 机器人长连(WSClient)
+channels-wecom = [
+  "wecom-aibot-sdk-python",
+  "cryptography>=41.0",
+]
+
+# MCP 工具面 HTTP 传输(boss / web-search / 通用 MCP server)
+mcp = [
+  "httpx>=0.27",
+]
+
+# 浏览器自动化 (BOSS 登录扫码 / scan_jobs / greet_job / pull_conversations).
+# 只用 patchright, 不用原生 playwright: BOSS 直聘在 CDP 协议层检测自动化,
+# 原生 playwright 会被重定向到 about:blank; patchright 在 Chromium 二进制
+# 层打补丁移除 CDP 指纹. 决策与复盘见
+# docs/archive/debug-boss-antibot-postmortem.md 和 browser-agent-architecture-decision.md.
+browser = [
+  "patchright>=1.48",
+]
+
+# 一把梭: 本地开发机安装全量能力
+all = [
+  "pulse-agent[db,channels-wecom,mcp,browser]",
 ]
 
 [project.scripts]

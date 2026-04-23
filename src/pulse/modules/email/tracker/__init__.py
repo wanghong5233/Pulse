@@ -1,0 +1,1 @@
+"""Email-domain tracker capability."""

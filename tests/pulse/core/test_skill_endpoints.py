@@ -13,8 +13,6 @@ def _create_isolated_app(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://postgres:pulse@localhost:15433/pulse")
     monkeypatch.setenv("PULSE_GENERATED_SKILLS_DIR", str(tmp_path / "generated_skills"))
     monkeypatch.setenv("PULSE_CORE_MEMORY_PATH", str(tmp_path / "core_memory.json"))
-    monkeypatch.setenv("PULSE_RECALL_COLLECTION_NAME", "test_skill_recall")
-    monkeypatch.setenv("PULSE_ARCHIVAL_COLLECTION_NAME", "test_skill_archival")
     monkeypatch.setenv("PULSE_SOUL_CONFIG_PATH", str(tmp_path / "soul.yaml"))
     get_settings.cache_clear()
     app = create_app()

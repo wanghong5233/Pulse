@@ -1,3 +1,10 @@
+"""Intel knowledge store —— PG-backed，agentic search 检索。
+
+Intel 是 Pulse 用来沉淀"领域知识片段"的存储（例如岗位情报、趋势摘要等）。
+它的检索路径是 **agentic search**：上层生成关键词或调用 `search_keyword`，
+内核不自带向量语义召回。
+"""
+
 from __future__ import annotations
 
 import json
@@ -6,30 +13,24 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .storage.engine import DatabaseEngine
-from .storage.vector import LocalVectorStore
 
 
 class IntelKnowledgeStore:
-    """Intel knowledge store backed by PostgreSQL + ChromaDB vector index."""
+    """PostgreSQL-backed intel knowledge store (agentic search, no vector)."""
 
     def __init__(
         self,
         *,
         storage_path: str | None = None,
-        collection_name: str = "pulse_intel_knowledge",
         db_engine: DatabaseEngine | None = None,
-        vector_store: LocalVectorStore | None = None,
     ) -> None:
         _ = storage_path
-        self._collection_name = str(collection_name or "pulse_intel_knowledge").strip()
         self._db = db_engine or DatabaseEngine()
-        self._store = vector_store or LocalVectorStore()
         self._ensure_schema()
-        self._bootstrap_vector_index()
 
     @property
     def storage_path(self) -> str:
-        return f"pg://intel_documents (collection: {self._collection_name})"
+        return "pg://intel_documents"
 
     def _ensure_schema(self) -> None:
         self._db.execute(
@@ -55,32 +56,9 @@ class IntelKnowledgeStore:
             "CREATE INDEX IF NOT EXISTS idx_intel_docs_collected ON intel_documents(collected_at)"
         )
 
-    def _bootstrap_vector_index(self) -> None:
-        count = self._store.collection_count(collection=self._collection_name)
-        if count > 0:
-            return
-        rows = self._db.execute(
-            "SELECT id, title, content, category FROM intel_documents ORDER BY collected_at DESC LIMIT 5000",
-            fetch="all",
-        )
-        if not rows:
-            return
-        batch = []
-        for row in rows:
-            doc_id = str(row[0])
-            title = str(row[1] or "")
-            content = str(row[2] or "")
-            category = str(row[3] or "")
-            text = f"{title}\n{content}".strip()
-            if text:
-                batch.append({"id": doc_id, "text": text[:4000], "metadata": {"category": category}})
-        if batch:
-            self._store.upsert_texts(collection=self._collection_name, rows=batch)
-
     def append(self, rows: list[dict[str, Any]]) -> int:
         now_iso = datetime.now(timezone.utc).isoformat()
         inserted = 0
-        vector_batch: list[dict[str, Any]] = []
 
         for row in rows:
             if not isinstance(row, dict):
@@ -117,14 +95,6 @@ class IntelKnowledgeStore:
                 ),
             )
             inserted += 1
-            text = f"{title}\n{content}".strip()
-            if text:
-                vector_batch.append({
-                    "id": doc_id, "text": text[:4000], "metadata": {"category": category},
-                })
-
-        if vector_batch:
-            self._store.upsert_texts(collection=self._collection_name, rows=vector_batch)
         return inserted
 
     def recent(self, *, limit: int = 5000, category: str | None = None) -> list[dict[str, Any]]:
@@ -149,34 +119,60 @@ class IntelKnowledgeStore:
             return []
         return [self._row_to_dict(r) for r in rows]
 
-    def search(self, *, query: str, top_k: int = 10, category: str | None = None) -> list[dict[str, Any]]:
-        hits = self._store.query_texts(
-            collection=self._collection_name, query=query, top_k=max(1, top_k),
-        )
-        if not hits:
+    def search(
+        self,
+        *,
+        query: str | None = None,
+        keywords: list[str] | None = None,
+        top_k: int = 10,
+        category: str | None = None,
+        match: str = "any",
+    ) -> list[dict[str, Any]]:
+        """Agentic keyword search over title / content / summary.
+
+        支持两种入参（兼容历史调用方）：
+        - `query`: 单个查询串（当成一个 keyword）
+        - `keywords`: 多关键词列表，match="any"|"all"
+
+        多关键词同义词展开由上层 (Brain / Domain) 负责。
+        """
+        kw_list: list[str] = []
+        if keywords:
+            kw_list = [str(k).strip() for k in keywords if str(k or "").strip()]
+        elif query and str(query).strip():
+            kw_list = [str(query).strip()]
+        if not kw_list:
             return []
-        ids = [str(h["id"]) for h in hits]
-        placeholders = ",".join(["%s"] * len(ids))
-        sql = f"SELECT id, category, title, content, summary, source_url, source, tags, collected_at, metadata FROM intel_documents WHERE id IN ({placeholders})"
-        rows = self._db.execute(sql, tuple(ids), fetch="all")
+
+        safe_top_k = max(1, min(int(top_k), 100))
+        safe_category = str(category or "").strip().lower()
+        match_mode = "all" if str(match).strip().lower() == "all" else "any"
+        joiner = " AND " if match_mode == "all" else " OR "
+
+        where: list[str] = []
+        params: list[Any] = []
+
+        kw_clauses: list[str] = []
+        for kw in kw_list:
+            kw_clauses.append("(title ILIKE %s OR content ILIKE %s OR summary ILIKE %s)")
+            pattern = f"%{kw}%"
+            params.extend([pattern, pattern, pattern])
+        where.append("(" + joiner.join(kw_clauses) + ")")
+
+        if safe_category:
+            where.append("category = %s")
+            params.append(safe_category)
+
+        sql = (
+            "SELECT id, category, title, content, summary, source_url, source, tags, collected_at, metadata "
+            "FROM intel_documents WHERE " + " AND ".join(where)
+            + " ORDER BY collected_at DESC LIMIT %s"
+        )
+        params.append(safe_top_k)
+        rows = self._db.execute(sql, tuple(params), fetch="all")
         if not rows:
             return []
-        row_map = {str(item["id"]): item for item in (self._row_to_dict(r) for r in rows)}
-        safe_category = str(category or "").strip().lower()
-        result: list[dict[str, Any]] = []
-        for hit in hits:
-            doc_id = str(hit.get("id") or "")
-            item = row_map.get(doc_id)
-            if item is None:
-                continue
-            if safe_category and item.get("category") != safe_category:
-                continue
-            score = float(hit.get("similarity") or 0.0)
-            merged = dict(item)
-            merged["score"] = round(score, 6)
-            merged["similarity"] = round(score, 6)
-            result.append(merged)
-        return result
+        return [self._row_to_dict(r) for r in rows]
 
     @staticmethod
     def _row_to_dict(row: tuple[Any, ...]) -> dict[str, Any]:

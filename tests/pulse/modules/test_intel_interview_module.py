@@ -11,23 +11,23 @@ pytestmark = pytest.mark.usefixtures("postgres_test_db")
 def test_intel_interview_collect_report_and_push_routes() -> None:
     app = create_app()
     with TestClient(app) as client:
-        health_resp = client.get("/api/modules/intel_interview/health")
+        health_resp = client.get("/api/modules/intel/interview/health")
         collect_resp = client.post(
-            "/api/modules/intel_interview/collect",
+            "/api/modules/intel/interview/collect",
             json={"keyword": "AI Agent", "max_items": 4, "source": "real"},
         )
         report_resp = client.get(
-            "/api/modules/intel_interview/daily-report",
+            "/api/modules/intel/interview/daily-report",
             params={"keyword": "AI Agent", "max_items": 3},
         )
         push_resp = client.post(
-            "/api/modules/intel_interview/daily-push",
+            "/api/modules/intel/interview/daily-push",
             json={"keyword": "AI Agent", "max_items": 3, "channel": "feishu"},
         )
-        schedule_status_resp = client.get("/api/modules/intel_interview/schedule/status")
-        schedule_trigger_resp = client.post("/api/modules/intel_interview/schedule/trigger")
-        schedule_start_resp = client.post("/api/modules/intel_interview/schedule/start")
-        schedule_stop_resp = client.post("/api/modules/intel_interview/schedule/stop")
+        schedule_status_resp = client.get("/api/modules/intel/interview/schedule/status")
+        schedule_trigger_resp = client.post("/api/modules/intel/interview/schedule/trigger")
+        schedule_start_resp = client.post("/api/modules/intel/interview/schedule/start")
+        schedule_stop_resp = client.post("/api/modules/intel/interview/schedule/stop")
 
     assert health_resp.status_code == 200
     assert health_resp.json()["status"] == "ok"

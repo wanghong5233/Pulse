@@ -55,6 +55,32 @@ class SchedulerEngine:
     def list_tasks(self) -> list[str]:
         return sorted(self._tasks.keys())
 
+    def get_task(self, name: str) -> ScheduleTask | None:
+        """Return the registered task, or None if unknown.
+
+        Used by per-patrol control surfaces (ADR-004 §6.1) that need to
+        read ``enabled`` / interval / active-hours flags in addition to the
+        summary shape of ``status()``.
+        """
+        return self._tasks.get(name)
+
+    def set_enabled(self, name: str, enabled: bool) -> bool:
+        """Flip a registered task's ``enabled`` flag in place.
+
+        Returns ``True`` when the task exists (flag now matches ``enabled``),
+        ``False`` when the task is unknown. Unknown names do **not** auto-
+        create tasks — ADR-004 §6.1.7 invariant #2 (fail-loud).
+
+        Idempotent: setting the same value twice is a no-op; the state of
+        ``_last_run_at`` / ``_consecutive_errors`` on ``AgentRuntime`` is
+        untouched, so flipping back on does not skip the usual gating.
+        """
+        task = self._tasks.get(name)
+        if task is None:
+            return False
+        task.enabled = bool(enabled)
+        return True
+
     def is_due(self, task: ScheduleTask, *, now: datetime) -> bool:
         if not task.enabled:
             return False

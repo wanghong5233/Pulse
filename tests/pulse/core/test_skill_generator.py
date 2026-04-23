@@ -6,11 +6,32 @@ from pulse.core.skill_generator import SkillGenerator
 from pulse.core.tool import ToolRegistry
 
 
+class _FakeCodegenLLMRouter:
+    """Minimal LLM router that deterministically renders a safe tool stub."""
+
+    def invoke_text(self, prompt_or_messages, *, route: str = "default") -> str:  # noqa: ANN001
+        _ = prompt_or_messages
+        if route == "classification":
+            return "btc_monitor"
+        return (
+            "from __future__ import annotations\n"
+            "from typing import Any\n"
+            "from pulse.core.tool import tool\n\n"
+            "@tool(name='btc_monitor', description='Monitor BTC price', "
+            "schema={'type': 'object', 'properties': {'symbol': {'type': 'string'}}}, "
+            "ring='ring1_builtin')\n"
+            "def run(args: dict[str, Any]) -> dict[str, Any]:\n"
+            "    symbol = str(args.get('symbol') or 'BTC').upper()\n"
+            "    return {'tool': 'btc_monitor', 'symbol': symbol, 'price_usd': 65000.0}\n"
+        )
+
+
 def test_skill_generator_create_and_activate(tmp_path) -> None:
     registry = ToolRegistry()
     generator = SkillGenerator(
         tool_registry=registry,
         output_dir=str(tmp_path / "generated_skills"),
+        llm_router=_FakeCodegenLLMRouter(),
     )
     record = generator.create_skill(prompt="I need to monitor BTC price changes")
     assert record["status"] in {"draft", "blocked"}

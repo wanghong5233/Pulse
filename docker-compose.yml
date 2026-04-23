@@ -1,6 +1,32 @@
 name: pulse
 
+# Default stack:
+#   - `docker compose up -d postgres pulse-api` starts the full stack.
+#   - `docker compose up -d postgres` starts only the DB sidecar.
+#
+# Environment variables feed in from `.env`; anything not listed here falls
+# back to the application defaults in `src/pulse/core/config.py`.
+
 services:
+  postgres:
+    image: postgres:16
+    container_name: pulse-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pulse
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: pulse
+    ports:
+      - "15433:5432"
+    volumes:
+      - pulse_pg_data:/var/lib/postgresql/data
+      - ./infra/sql/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pulse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   pulse-api:
     build:
       context: .
@@ -11,35 +37,44 @@ services:
       PULSE_ENVIRONMENT: docker
       PULSE_HOST: 0.0.0.0
       PULSE_PORT: 8010
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:pulse@postgres:5432/pulse}
+      LANGGRAPH_CHECKPOINT_DATABASE_URL: ${LANGGRAPH_CHECKPOINT_DATABASE_URL:-postgresql://postgres:pulse@postgres:5432/pulse}
+
       PULSE_ROUTER_RULES_PATH: /app/config/router_rules.json
       PULSE_POLICY_RULES_PATH: /app/config/policy_rules.json
-      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:pulse@host.docker.internal:15433/pulse}
+      PULSE_EVOLUTION_RULES_PATH: /app/config/evolution_rules.json
+      PULSE_SOUL_CONFIG_PATH: /app/config/soul.yaml
+      PULSE_MCP_SERVERS_CONFIG_PATH: /app/config/mcp_servers.yaml
+
       PULSE_CORE_MEMORY_PATH: /root/.pulse/core_memory.json
-      PULSE_RECALL_COLLECTION_NAME: pulse_recall_memory
-      PULSE_ARCHIVAL_COLLECTION_NAME: pulse_archival_memory
       PULSE_GOVERNANCE_AUDIT_PATH: /root/.pulse/governance_audit.json
       PULSE_GOVERNANCE_RULES_VERSIONS_PATH: /root/.pulse/governance_rules_versions.json
-      PULSE_EVOLUTION_RULES_PATH: /app/config/evolution_rules.json
       PULSE_DPO_PAIRS_PATH: /root/.pulse/dpo_pairs.jsonl
       PULSE_DPO_AUTO_COLLECT: ${PULSE_DPO_AUTO_COLLECT:-true}
       PULSE_EVOLUTION_DEFAULT_MODE: ${PULSE_EVOLUTION_DEFAULT_MODE:-autonomous}
       PULSE_EVOLUTION_PREFS_MODE: ${PULSE_EVOLUTION_PREFS_MODE:-autonomous}
       PULSE_EVOLUTION_SOUL_MODE: ${PULSE_EVOLUTION_SOUL_MODE:-supervised}
       PULSE_EVOLUTION_BELIEF_MODE: ${PULSE_EVOLUTION_BELIEF_MODE:-autonomous}
-      PULSE_SOUL_CONFIG_PATH: /app/config/soul.yaml
       PULSE_GENERATED_SKILLS_DIR: /root/.pulse/generated/skills
+
       PULSE_MCP_HTTP_BASE_URL: ${PULSE_MCP_HTTP_BASE_URL:-}
       PULSE_MCP_HTTP_TIMEOUT_SEC: ${PULSE_MCP_HTTP_TIMEOUT_SEC:-8}
       PULSE_MCP_HTTP_AUTH_TOKEN: ${PULSE_MCP_HTTP_AUTH_TOKEN:-}
+
       FEISHU_WEBHOOK_URL: ${FEISHU_WEBHOOK_URL:-}
       NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
       PULSE_FEISHU_SIGN_SECRET: ${PULSE_FEISHU_SIGN_SECRET:-}
+
       INTEL_INTERVIEW_PUSH_INTERVAL_SEC: ${INTEL_INTERVIEW_PUSH_INTERVAL_SEC:-3600}
       INTEL_TECHRADAR_PUSH_INTERVAL_SEC: ${INTEL_TECHRADAR_PUSH_INTERVAL_SEC:-3600}
     volumes:
       - pulse_memory_data:/root/.pulse
     ports:
       - "8010:8010"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
+  pulse_pg_data:
   pulse_memory_data:

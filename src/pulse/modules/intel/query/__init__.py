@@ -1,0 +1,1 @@
+"""Intel-domain query capability."""

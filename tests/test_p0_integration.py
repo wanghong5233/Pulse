@@ -434,7 +434,7 @@ def test_compaction_session_workspace():
 
 
 def test_workspace_memory():
-    """验证 WorkspaceMemory 类存在且有正确的方法签名。"""
+    """验证 WorkspaceMemory 类存在且对外只暴露统一的 Any-in/Any-out facts API。"""
     from pulse.core.memory.workspace_memory import WorkspaceMemory
     import inspect as _inspect
 
@@ -442,13 +442,24 @@ def test_workspace_memory():
     assert hasattr(WorkspaceMemory, "set_summary")
     assert hasattr(WorkspaceMemory, "get_fact")
     assert hasattr(WorkspaceMemory, "set_fact")
-    assert hasattr(WorkspaceMemory, "list_facts")
+    assert hasattr(WorkspaceMemory, "list_facts_by_prefix")
     assert hasattr(WorkspaceMemory, "delete_fact")
+    assert hasattr(WorkspaceMemory, "delete_facts_by_prefix")
     assert hasattr(WorkspaceMemory, "read_essentials")
+
+    for removed in ("list_facts", "get_facts", "add_fact", "set_fact_json", "get_fact_value"):
+        assert not hasattr(WorkspaceMemory, removed), (
+            f"WorkspaceMemory should not expose legacy {removed!r}; "
+            "API is unified on set_fact(Any) / get_fact(...) -> Any"
+        )
 
     sig = _inspect.signature(WorkspaceMemory.read_essentials)
     params = list(sig.parameters.keys())
     assert "workspace_id" in params, f"read_essentials should accept workspace_id, got {params}"
+
+    set_sig = _inspect.signature(WorkspaceMemory.set_fact)
+    assert "value" in set_sig.parameters
+    assert "source" in set_sig.parameters
 
     print("  [PASS] WorkspaceMemory class and method signatures OK")
 
@@ -641,6 +652,14 @@ def test_manual_wake():
         handler=ok_handler,
         peak_interval=60,
         offpeak_interval=120,
+        # ADR-004 §6.1.1: manual_wake / heartbeat Stage 5 MUST honor
+        # ScheduleTask.enabled. This test exercises the positive path
+        # (user has already enabled the patrol via IM), so we flip it
+        # on at register time. The negative contract (disabled patrols
+        # are skipped) is pinned by
+        # test_agent_runtime_patrol_control.py::
+        # test_manual_wake_skips_disabled_patrol_and_runs_enabled_one.
+        enabled=True,
     )
     # 先执行一次让 stats 存在
     rt._execute_patrol("wake_test.patrol", ok_handler)
@@ -893,18 +912,21 @@ def test_stopreason_completeness():
 
 
 def test_envelope_new_fields():
-    """验证 MemoryEnvelope 包含所有设计文档要求的字段。"""
+    """验证 MemoryEnvelope 包含所有设计文档要求的字段。
+
+    Pulse 采用 agentic search，envelope 不含 embedding 字段
+    （参见 docs/Pulse-MemoryRuntime设计.md 附录 B）。
+    """
     from pulse.core.memory.envelope import MemoryEnvelope
     env = MemoryEnvelope()
-    assert hasattr(env, "embedding"), "Missing embedding"
+    assert not hasattr(env, "embedding"), "embedding should be removed (agentic search)"
     assert hasattr(env, "status"), "Missing status"
     assert hasattr(env, "updated_at"), "Missing updated_at"
     assert hasattr(env, "valid_from"), "Missing valid_from"
     assert hasattr(env, "valid_to"), "Missing valid_to"
     assert env.status == "active"
-    assert env.embedding is None
     d = env.to_dict()
-    assert "embedding" in d
+    assert "embedding" not in d
     assert "status" in d
     assert "updated_at" in d
     assert "valid_from" in d
@@ -952,14 +974,29 @@ def test_promotion_three_paths():
     print("  [PASS] Promotion three paths OK")
 
 
-def test_workspace_memory_aliases():
-    """验证 WorkspaceMemory 有 get_facts 和 add_fact 别名。"""
-    from pulse.core.memory.workspace_memory import WorkspaceMemory
-    assert hasattr(WorkspaceMemory, "get_facts"), "Missing get_facts alias"
-    assert hasattr(WorkspaceMemory, "add_fact"), "Missing add_fact alias"
-    assert WorkspaceMemory.get_facts is WorkspaceMemory.list_facts
-    assert WorkspaceMemory.add_fact is WorkspaceMemory.set_fact
-    print("  [PASS] WorkspaceMemory aliases OK")
+def test_workspace_memory_fact_roundtrip():
+    """验证 WorkspaceMemory 统一的 set_fact(Any) → get_fact() -> Any 契约。
+
+    历史上这里有 get_facts / add_fact / set_fact_json / get_fact_value 等别名,
+    统一后只保留 set_fact / get_fact / list_facts_by_prefix, value 列永远 JSON 编码。
+    """
+    from pulse.core.memory.workspace_memory import WorkspaceMemory, Fact
+    import inspect as _inspect
+
+    sig_get = _inspect.signature(WorkspaceMemory.get_fact)
+    assert "default" in sig_get.parameters, (
+        "get_fact must accept a default sentinel for missing keys"
+    )
+    sig_set = _inspect.signature(WorkspaceMemory.set_fact)
+    # value 是 Any, 不应再限制为 str
+    assert sig_set.parameters["value"].annotation in (_inspect.Parameter.empty,) or \
+        "str" not in str(sig_set.parameters["value"].annotation), \
+        "set_fact.value should accept Any (JSON-serialisable), not be pinned to str"
+
+    assert Fact.__annotations__["value"] is not str, (
+        "Fact.value should be Any after decoding, never raw str"
+    )
+    print("  [PASS] WorkspaceMemory unified fact API signature OK")
 
 
 def test_archival_supersede_method():
@@ -994,7 +1031,6 @@ def test_envelope_roundtrip():
     assert env2.evidence_refs == env.evidence_refs
     assert env2.superseded_by == env.superseded_by
     assert env2.source == env.source
-    assert env2.embedding is None
     print("  [PASS] Envelope roundtrip OK")
 
 
@@ -1077,7 +1113,7 @@ if __name__ == "__main__":
         test_envelope_new_fields,
         test_operational_memory,
         test_promotion_three_paths,
-        test_workspace_memory_aliases,
+        test_workspace_memory_fact_roundtrip,
         test_archival_supersede_method,
         test_envelope_roundtrip,
         test_pause_patrols,

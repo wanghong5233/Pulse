@@ -5,6 +5,9 @@
 2. Layer × Scope 双轴模型可追溯
 3. 为后续 Compaction / Promotion 提供统一数据结构
 
+注：不含 `embedding` 字段。Pulse 检索路径采用 agentic search，
+内核不维护向量表示。详见 `docs/Pulse-MemoryRuntime设计.md` 附录 B。
+
 设计参考：Pulse-MemoryRuntime设计.md §8 / §9
 """
 
@@ -18,14 +21,23 @@ from uuid import uuid4
 
 
 class MemoryLayer(str, Enum):
-    """记忆层级 — 回答"存在哪一层" """
+    """记忆层级 — 回答"存在哪一层".
+
+    架构决策: ``meta`` 已**废弃**(2026-04). 审计/合规改走独立的 ``EventLog``
+    观测平面 (``core/event_types.py`` + ``core/event_sinks.py``), 不再和
+    "给 LLM 读" 的记忆存储混在一起. 历史代码若仍产生 ``MemoryLayer.meta``
+    envelope, Brain 会在 ``_route_envelope`` 里把它重路由到事件流, 不再落
+    入记忆表.
+
+    详见 ``docs/Pulse-内核架构总览.md`` §6 Observability Plane.
+    """
 
     operational = "operational"
     recall = "recall"
     workspace = "workspace"
     archival = "archival"
     core = "core"
-    meta = "meta"
+    meta = "meta"  # DEPRECATED: 改用 EventLog (event_types.EventTypes)
 
 
 class MemoryScope(str, Enum):
@@ -90,9 +102,6 @@ class MemoryEnvelope:
     valid_from: datetime | None = None
     valid_to: datetime | None = None
 
-    # ── 向量嵌入（用于语义检索）────────────────────────────────
-    embedding: list[float] | None = None
-
     # ── Promotion / Compaction 追溯 ─────────────────────────
     promoted_from: str | None = None
     promotion_reason: str | None = None
@@ -120,7 +129,6 @@ class MemoryEnvelope:
             "status": self.status,
             "valid_from": self.valid_from.isoformat() if self.valid_from else None,
             "valid_to": self.valid_to.isoformat() if self.valid_to else None,
-            "embedding": self.embedding,
             "promoted_from": self.promoted_from,
             "promotion_reason": self.promotion_reason,
             "evidence_refs": self.evidence_refs,
@@ -157,7 +165,6 @@ class MemoryEnvelope:
             status=data.get("status", "active"),
             valid_from=_parse_dt(data.get("valid_from")),
             valid_to=_parse_dt(data.get("valid_to")),
-            embedding=data.get("embedding"),
             promoted_from=data.get("promoted_from"),
             promotion_reason=data.get("promotion_reason"),
             evidence_refs=data.get("evidence_refs", []),

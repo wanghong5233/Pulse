@@ -1,0 +1,50 @@
+# ============================================================================
+# Pulse Job Profile TEMPLATE (domain=job)
+#
+# 用法:
+#   cp config/profile/job.example.yaml config/profile/job.yaml
+#   vim config/profile/job.yaml       # 填入你的真实求职偏好
+#   pulse profile load --domain=job   # 种进 JobMemory
+#
+# 契约:
+#   - 这是 JobMemory 的**持久化镜像**, 不是独立事实源
+#   - Brain 更新偏好后会 auto-rewrite job.yaml (你的注释会丢)
+#   - 你手工改 yaml 后, **必须运行 `pulse profile load`** 才会生效
+#   - 字段完整说明: src/pulse/modules/job/profile/schema.py
+# ============================================================================
+
+# ── 意向 ──
+target_roles:
+  - AI Agent Engineer
+  - LLM Application Engineer
+preferred_location:
+  - 杭州
+  - 上海
+salary_floor_daily: 800        # 日薪下限, RMB (实习)
+salary_floor_monthly: 25000    # 月薪下限, RMB (全职)
+
+# ── 能力画像 ──
+skills:
+  - Python
+  - LangChain
+  - FastAPI
+  - PostgreSQL
+experience_level: "应届 / 1 年内"
+tech_stack:
+  - Python
+  - TypeScript
+
+# ── 匹配约束 ──
+company_size: "不限"       # "大厂" / "中厂" / "创业公司" / "不限"
+remote_ok: true
+work_mode:
+  - hybrid
+  - remote
+
+# ── 排除项 ──
+blocked_companies:
+  - name: 拼多多
+    reason: 加班强度不匹配
+blocked_keywords:
+  - keyword: 外包
+    reason: 避免外包岗

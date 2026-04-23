@@ -4,10 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE="$PROJECT_DIR/.env"
-VENV_DIR="${PULSE_VENV_DIR:-$PROJECT_DIR/.venv}"
-PY_BIN="${PULSE_PYTHON_BIN:-python}"
-HOST="${PULSE_HOST:-0.0.0.0}"
-PORT="${PULSE_PORT:-8010}"
 
 load_env() {
   [[ -f "$ENV_FILE" ]] || return 0
@@ -24,12 +20,11 @@ load_env() {
 }
 
 activate_venv_if_exists() {
-  # Resolve symlinks so we get the real venv directory
   local real_venv
   real_venv="$(readlink -f "$VENV_DIR" 2>/dev/null || echo "$VENV_DIR")"
 
   if [[ -x "$real_venv/bin/python3" ]]; then
-    # Use the venv python directly — 'source activate' is unreliable on NTFS mounts
+    # 直接用 venv 的 python; 'source activate' 在 NTFS 挂载点上不稳定
     PY_BIN="$real_venv/bin/python3"
     export VIRTUAL_ENV="$real_venv"
     export PATH="$real_venv/bin:$PATH"
@@ -42,7 +37,13 @@ activate_venv_if_exists() {
   fi
 }
 
+# 注意: 变量初始化必须发生在 load_env 之后, 否则 .env 里的
+# PULSE_VENV_DIR / PULSE_PYTHON_BIN / PULSE_HOST / PULSE_PORT 不会生效。
 load_env
+VENV_DIR="${PULSE_VENV_DIR:-$PROJECT_DIR/.venv}"
+PY_BIN="${PULSE_PYTHON_BIN:-python}"
+HOST="${PULSE_HOST:-0.0.0.0}"
+PORT="${PULSE_PORT:-8010}"
 activate_venv_if_exists
 export PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 

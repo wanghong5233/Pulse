@@ -10,7 +10,17 @@ from ._helpers import http_get_json, safe_float, safe_int
 
 @tool(
     name="flight.search",
-    description="Search flights via configured external provider",
+    description="Search flights via externally configured provider (requires PULSE_FLIGHT_SEARCH_BASE_URL).",
+    when_to_use=(
+        "查询**民航航班**售票信息 (依赖外部 provider, 需 PULSE_FLIGHT_SEARCH_BASE_URL)。"
+        "query 应包含起点 / 终点 / 日期三要素; 要素缺失时由调用方先澄清, 不填默认值。"
+        "返回 items 数组为 provider 原样透传, 不做本地 rerank。"
+    ),
+    when_not_to_use=(
+        "能力边界外: 1) 仅涵盖航空, 不支持高铁 / 火车 / 大巴等陆面交通; "
+        "2) 未配置 PULSE_FLIGHT_SEARCH_BASE_URL 时返回 ok=false, 调用方不得据此伪造航班号; "
+        "3) 无法单独做价格预测 / 经济性建议 (provider 不提供这类语义)。"
+    ),
     ring="ring1_builtin",
     schema={
         "type": "object",

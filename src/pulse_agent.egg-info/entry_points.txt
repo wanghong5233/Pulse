@@ -1,2 +1,0 @@
-[console_scripts]
-pulse = pulse.cli:main

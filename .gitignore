@@ -6,29 +6,52 @@ __pycache__/
 .mypy_cache/
 .venv/
 
+# Build / egg-info
+*.egg-info/
+dist/
+build/
+
 # Environment (contains API keys, passwords, webhooks)
 .env
 .env.local
 
 # Logs
+logs/
 *.log
-
-# ChromaDB local persistence
-chroma_db/
 
 # Playwright browser profile (contains BOSS Cookies, Login Data, Sessions)
 .playwright/
-backend/.playwright/
-backend/backend/
 
-# Uploaded user data
+# User data / runtime exports
 data/
+generated/skills/
 
-# Node / Frontend
-node_modules/
-.next/
-dist/
-tsconfig.tsbuildinfo
+# 浏览器自动化截图 / 本地导出 (可能含 BOSS 页面、聊天、岗位等 PII)
+src/backend/exports/
+
+# 求职域 profile 目录下的简历附件 (PDF 等) —— 只提交代码与 schema, 不提交真实简历
+src/pulse/modules/job/profile/*.pdf
+src/pulse/modules/job/profile/*.doc
+src/pulse/modules/job/profile/*.docx
+
+# Domain Profile yaml: 用户私有人类画像 (memory 的实时投影)。
+# 模板 *.example.yaml 可以提交; 实际 <domain>.yaml 不提交。
+config/profile/*.yaml
+!config/profile/*.example.yaml
+# 简历原文: 含真实姓名/手机/邮箱/微信等 PII。
+config/profile/resume.md
+
+# Handoff / 面试交接材料: 内部上下文快照 (含数据库 dump 与 PII),
+# 不对外, 不进 public repo。
+docs/handoff/
+
+# 外部站点真实 DOM 快照: selector fixture 的支撑证据, 含第三方 HR/公司
+# 真实对话内容, 默认不公开。README.md (selector 说明) 保留可提交。
+docs/dom-specs/**/*.html
+docs/dom-specs/**/*.json
+
+# 临时调试脚本: 以 _tmp_ 前缀的一律视为一次性, 不进版本库。
+scripts/_tmp_*
 
 # IDE
 .vscode/
@@ -38,20 +61,3 @@ tsconfig.tsbuildinfo
 # OS
 .DS_Store
 Thumbs.db
-
-# Personal notes (not for public repo)
-Pulse实施方案.md
-openclaw调研.md
-Demo录制检查清单.md
-Demo演示脚本.md
-OpenClaw部署复盘与踩坑手册.md
-OpenClaw面试速查手册.md
-
-# Logs
-backend/logs/
-
-# Runtime exports (screenshots, generated materials - not source code)
-backend/exports/
-
-# Docs (generated separately)
-docs

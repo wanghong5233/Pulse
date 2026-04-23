@@ -1,12 +1,12 @@
 {
+  "_comment_purpose": "Legacy slash-command router (see docs/Pulse-DomainMemory与Tool模式.md §3.4).",
+  "_comment_status": "Being phased out. All slash commands SHOULD reach the Brain (which has intent tools + command_conventions prompt). Rules below are kept only for business modules that have not yet migrated to IntentSpec. New modules MUST NOT add entries here.",
+  "_comment_migration": "job_profile / job_greet / job_chat have all migrated to IntentSpec tools — their rules are removed. Remaining entries are for email / intel which still use coarse handle_intent; remove them once those modules adopt IntentSpec. /help is handled by Brain system prompt (prompt_contract.py _section_command_conventions).",
+
   "fallback_intent": "general.default",
   "fallback_target": "hello",
   "intents": {
     "general.default": "hello",
-    "boss.scan": "boss_greet",
-    "boss.greet.trigger": "boss_greet",
-    "boss.chat.pull": "boss_chat",
-    "boss.chat.process": "boss_chat",
     "email.process": "email_tracker",
     "email.fetch": "email_tracker",
     "intel.interview.collect": "intel_interview",
@@ -20,17 +20,12 @@
     { "key": "/ping", "intent": "general.default" }
   ],
   "prefix": [
-    { "prefix": "/scan", "intent": "boss.scan" },
-    { "prefix": "/greet", "intent": "boss.greet.trigger" },
-    { "prefix": "/chat pull", "intent": "boss.chat.pull" },
-    { "prefix": "/chat process", "intent": "boss.chat.process" },
     { "prefix": "/email process", "intent": "email.process" },
     { "prefix": "/email fetch", "intent": "email.fetch" },
     { "prefix": "/intel interview collect", "intent": "intel.interview.collect" },
     { "prefix": "/intel interview report", "intent": "intel.interview.report" },
     { "prefix": "/intel radar collect", "intent": "intel.techradar.collect" },
     { "prefix": "/intel radar report", "intent": "intel.techradar.report" },
-    { "prefix": "/intel query", "intent": "intel.query.search" },
-    { "prefix": "/help", "intent": "general.default" }
+    { "prefix": "/intel query", "intent": "intel.query.search" }
   ]
 }

@@ -12,8 +12,6 @@ pytestmark = pytest.mark.usefixtures("postgres_test_db")
 def _create_isolated_app(tmp_path, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://postgres:pulse@localhost:15433/pulse")
     monkeypatch.setenv("PULSE_CORE_MEMORY_PATH", str(tmp_path / "core_memory.json"))
-    monkeypatch.setenv("PULSE_RECALL_COLLECTION_NAME", "test_evolution_recall")
-    monkeypatch.setenv("PULSE_ARCHIVAL_COLLECTION_NAME", "test_evolution_archival")
     monkeypatch.setenv("PULSE_GOVERNANCE_AUDIT_PATH", str(tmp_path / "governance_audit.json"))
     monkeypatch.setenv("PULSE_DPO_PAIRS_PATH", str(tmp_path / "dpo_pairs.jsonl"))
     monkeypatch.setenv("PULSE_EVOLUTION_SOUL_MODE", "supervised")

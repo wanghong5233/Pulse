@@ -219,9 +219,23 @@ class PromotionEngine:
         if path == PromotionPath.recall_to_core:
             if self._core is not None:
                 try:
-                    block_name = candidate.predicate.lower().replace(" ", "_")
-                    self._core.update_block(block_name, candidate.object_value)
-                except (AttributeError, TypeError) as exc:
+                    # CoreMemory.update_block 是 keyword-only 且 block 必须是
+                    # soul/user/prefs/context 之一. 不匹配则落 prefs[<predicate>].
+                    pred_key = candidate.predicate.lower().replace(" ", "_")
+                    if pred_key in ("soul", "user", "prefs", "context"):
+                        block_name = pred_key
+                        block_content: Any = (
+                            candidate.object_value
+                            if isinstance(candidate.object_value, dict)
+                            else {"value": candidate.object_value}
+                        )
+                    else:
+                        block_name = "prefs"
+                        block_content = {pred_key: candidate.object_value}
+                    self._core.update_block(
+                        block=block_name, content=block_content, merge=True,
+                    )
+                except (AttributeError, TypeError, ValueError) as exc:
                     return PromotionResult(
                         promoted=False, path=path, candidate=candidate,
                         reason=f"core write failed: {exc}",

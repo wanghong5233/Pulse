@@ -11,9 +11,9 @@ pytestmark = pytest.mark.usefixtures("postgres_test_db")
 def test_intel_query_search_route_with_category_filter() -> None:
     app = create_app()
     with TestClient(app) as client:
-        pre_health_resp = client.get("/api/modules/intel_query/health")
+        pre_health_resp = client.get("/api/modules/intel/query/health")
         ingest_resp = client.post(
-            "/api/modules/intel_query/ingest",
+            "/api/modules/intel/query/ingest",
             json={
                 "source": "test",
                 "items": [
@@ -44,9 +44,9 @@ def test_intel_query_search_route_with_category_filter() -> None:
                 ],
             },
         )
-        health_resp = client.get("/api/modules/intel_query/health")
+        health_resp = client.get("/api/modules/intel/query/health")
         resp = client.post(
-            "/api/modules/intel_query/search",
+            "/api/modules/intel/query/search",
             json={"query": "agent observability", "top_k": 3, "category": "techradar"},
         )
 

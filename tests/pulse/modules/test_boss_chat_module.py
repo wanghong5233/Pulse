@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
-from pulse.modules.boss_chat.module import BossChatModule
+from pulse.modules.job.chat.module import JobChatModule
 from pulse.core.server import create_app
 
 pytestmark = pytest.mark.usefixtures("postgres_test_db")
@@ -31,7 +32,7 @@ def test_boss_chat_requires_explicit_local_inbox_fallback(monkeypatch, tmp_path)
     monkeypatch.setenv("PULSE_BOSS_CHAT_INBOX_PATH", str(inbox_path))
     monkeypatch.setenv("PULSE_BOSS_ALLOW_LOCAL_INBOX_FALLBACK", "false")
 
-    module = BossChatModule()
+    module = JobChatModule()
     result = module.run_pull(
         max_conversations=10,
         unread_only=False,
@@ -48,10 +49,10 @@ def test_boss_chat_pull_and_process_routes(monkeypatch) -> None:
     monkeypatch.setenv("PULSE_BOSS_ALLOW_LOCAL_INBOX_FALLBACK", "true")
     app = create_app()
     with TestClient(app) as client:
-        health_resp = client.get("/api/modules/boss_chat/health")
-        session_resp = client.get("/api/modules/boss_chat/session/check")
+        health_resp = client.get("/api/modules/job/chat/health")
+        session_resp = client.get("/api/modules/job/chat/session/check")
         ingest_resp = client.post(
-            "/api/modules/boss_chat/inbox/ingest",
+            "/api/modules/job/chat/inbox/ingest",
             json={
                 "source": "test",
                 "items": [
@@ -67,7 +68,7 @@ def test_boss_chat_pull_and_process_routes(monkeypatch) -> None:
             },
         )
         process_resp = client.post(
-            "/api/modules/boss_chat/process",
+            "/api/modules/job/chat/process",
             json={
                 "max_conversations": 10,
                 "unread_only": True,
@@ -80,7 +81,7 @@ def test_boss_chat_pull_and_process_routes(monkeypatch) -> None:
             },
         )
         pull_resp = client.post(
-            "/api/modules/boss_chat/pull",
+            "/api/modules/job/chat/pull",
             json={
                 "max_conversations": 10,
                 "unread_only": False,
@@ -90,7 +91,7 @@ def test_boss_chat_pull_and_process_routes(monkeypatch) -> None:
         )
         pull_data = pull_resp.json()
         execute_preview_resp = client.post(
-            "/api/modules/boss_chat/execute",
+            "/api/modules/job/chat/execute",
             json={
                 "conversation_id": pull_data["items"][0]["conversation_id"],
                 "action": "reply_from_profile",
@@ -125,3 +126,39 @@ def test_boss_chat_pull_and_process_routes(monkeypatch) -> None:
     execute_preview = execute_preview_resp.json()
     assert execute_preview["ok"] is True
     assert execute_preview["needs_confirmation"] is True
+
+
+def test_patrol_forces_real_auto_execute_even_if_policy_defaults_are_preview_only() -> None:
+    class _FakeService:
+        def __init__(self) -> None:
+            # Simulate the historical default that blocked real patrol execution:
+            # chat_auto_execute=false + hitl_required=true.
+            self.policy = SimpleNamespace(
+                default_profile_id="default",
+                auto_execute=False,
+                hitl_required=True,
+            )
+            self.calls: list[dict[str, object]] = []
+
+        def run_process(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(dict(kwargs))
+            return {"ok": True, "items": []}
+
+    fake = _FakeService()
+    module = JobChatModule(service=fake)
+    out = module._patrol(ctx=object())  # _patrol ignores ctx payload.
+
+    assert out["ok"] is True
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["unread_only"] is True
+    assert call["chat_tab"] == "未读"
+    assert call["fetch_latest_hr"] is True
+    assert call["auto_execute"] is True, (
+        "patrol path must execute real actions after explicit user enable; "
+        "preview-only defaults belong to interactive process intent, not patrol."
+    )
+    assert call["confirm_execute"] is True, (
+        "enabling patrol is already an explicit confirmation; patrol ticks must "
+        "not be blocked by per-turn HITL gates."
+    )

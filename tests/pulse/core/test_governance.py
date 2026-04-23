@@ -48,7 +48,9 @@ def test_governance_audit_and_rollback(tmp_path) -> None:
 
     rollback = governance.rollback(change_id=change_id, actor="tester")
     assert rollback["ok"] is True
-    assert core.preference("default_location") == "beijing"
+    # CoreMemory.prefs 无硬编码业务默认值 (见 _build_default_data 注释),
+    # rollback 到未设置状态 → preference(...) 返回 None。
+    assert core.preference("default_location") is None
 
     audits = governance.list_audits(limit=10)
     assert len(audits) >= 1
@@ -71,7 +73,8 @@ def test_governance_supervised_requires_approval(tmp_path) -> None:
     )
     assert pending["ok"] is False
     assert pending["status"] == "pending_approval"
-    assert core.preference("default_location") == "beijing"
+    # Pending 期间尚未写入 CoreMemory, 又无默认值 → 返回 None。
+    assert core.preference("default_location") is None
 
     approved = governance.approve_change(change_id=pending["change_id"], actor="reviewer")
     assert approved["ok"] is True

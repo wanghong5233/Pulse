@@ -9,10 +9,10 @@ __pycache__
 *.pyd
 *.log
 
-backend
-frontend
+logs
+data
+generated
 infra
-skills
 scripts
 docs
 tests

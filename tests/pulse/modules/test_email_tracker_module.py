@@ -10,9 +10,9 @@ pytestmark = pytest.mark.usefixtures("postgres_test_db")
 def test_email_tracker_process_fetch_and_heartbeat_routes() -> None:
     app = create_app()
     with TestClient(app) as client:
-        health_resp = client.get("/api/modules/email_tracker/health")
+        health_resp = client.get("/api/modules/email/tracker/health")
         one_resp = client.post(
-            "/api/modules/email_tracker/process-one",
+            "/api/modules/email/tracker/process-one",
             json={
                 "sender": "hr@demo.com",
                 "subject": "面试邀请",
@@ -20,10 +20,10 @@ def test_email_tracker_process_fetch_and_heartbeat_routes() -> None:
             },
         )
         fetch_resp = client.post(
-            "/api/modules/email_tracker/fetch-process",
+            "/api/modules/email/tracker/fetch-process",
             json={"max_items": 5, "mark_seen": False},
         )
-        status_resp = client.get("/api/modules/email_tracker/heartbeat/status")
+        status_resp = client.get("/api/modules/email/tracker/heartbeat/status")
 
     assert health_resp.status_code == 200
     assert health_resp.json()["runtime"]["mode"] == "imap_unconfigured"

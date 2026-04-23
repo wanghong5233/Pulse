@@ -1,12 +1,25 @@
+"""Archival memory —— 长期结构化事实存储。
+
+检索路径为 **agentic search**：
+- `recent(...)`: 时间序最近 N 条；
+- `query(subject=, predicate=)`: 按 SPO 精确字段过滤；
+- `search_keyword(keywords=...)`: SQL ILIKE 跨 subject/predicate/object 关键词匹配。
+
+内核不自带向量语义召回，参见
+`docs/Pulse-MemoryRuntime设计.md` 附录 B: Retrieval 策略抉择。
+"""
+
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from ..storage.engine import DatabaseEngine
-from ..storage.vector import LocalVectorStore
-from .envelope import MemoryEnvelope, MemoryKind
+from .envelope import MemoryEnvelope
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now_iso() -> str:
@@ -14,6 +27,7 @@ def _utc_now_iso() -> str:
 
 
 def _parse_metadata(raw: Any) -> dict[str, Any]:
+    """DB metadata 列 → dict. 解析失败 (schema 漂移) 记 debug, 不 raise."""
     if isinstance(raw, dict):
         return dict(raw)
     if isinstance(raw, str):
@@ -22,7 +36,11 @@ def _parse_metadata(raw: Any) -> dict[str, Any]:
             return {}
         try:
             parsed = json.loads(text)
-        except Exception:
+        except json.JSONDecodeError as exc:
+            logger.debug(
+                "archival_memory: metadata JSON decode failed (skipping): %s; raw=%r",
+                exc, text[:120],
+            )
             return {}
         return dict(parsed) if isinstance(parsed, dict) else {}
     return {}
@@ -35,22 +53,17 @@ def _normalize_object_text(value: Any) -> str:
 
 
 class ArchivalMemory:
-    """Archival memory backed by PostgreSQL facts + Chroma semantic index."""
+    """PostgreSQL-backed archival memory (agentic search, no vector)."""
 
     def __init__(
         self,
         *,
         storage_path: str | None = None,
-        collection_name: str = "pulse_archival_memory",
         db_engine: DatabaseEngine | None = None,
-        vector_store: LocalVectorStore | None = None,
     ) -> None:
         _ = storage_path
-        self._collection_name = str(collection_name or "pulse_archival_memory").strip()
         self._db = db_engine or DatabaseEngine()
-        self._store = vector_store or LocalVectorStore()
         self._ensure_schema()
-        self._bootstrap_vector_index()
 
     def _ensure_schema(self) -> None:
         self._db.execute(
@@ -96,36 +109,6 @@ class ArchivalMemory:
             self._db.execute(
                 f"ALTER TABLE facts ADD COLUMN IF NOT EXISTS {col} {col_type}"  # noqa: S608
             )
-
-    def _bootstrap_vector_index(self) -> None:
-        if self._store.collection_count(collection=self._collection_name) > 0:
-            return
-        rows = self._db.execute(
-            """
-            SELECT id, subject, predicate, object, source, confidence, valid_from
-            FROM facts
-            ORDER BY created_at ASC
-            """,
-            fetch="all",
-        ) or []
-        upsert_rows: list[dict[str, Any]] = []
-        for fact_id, subject, predicate, object_text, source, confidence, valid_from in rows:
-            upsert_rows.append(
-                {
-                    "id": f"fact:{int(fact_id)}",
-                    "text": f"{str(subject or '')} {str(predicate or '')} {str(object_text or '')}",
-                    "metadata": {
-                        "fact_id": int(fact_id),
-                        "subject": str(subject or ""),
-                        "predicate": str(predicate or ""),
-                        "source": str(source or ""),
-                        "confidence": float(confidence or 0.0),
-                        "timestamp": str(valid_from.isoformat() if hasattr(valid_from, "isoformat") else valid_from or ""),
-                    },
-                }
-            )
-        if upsert_rows:
-            self._store.upsert_texts(collection=self._collection_name, rows=upsert_rows)
 
     def add_fact(
         self,
@@ -187,23 +170,6 @@ class ArchivalMemory:
         fact_id = int(row[0])
         valid_from = row[1]
         valid_from_text = str(valid_from.isoformat() if hasattr(valid_from, "isoformat") else valid_from or timestamp)
-        self._store.upsert_texts(
-            collection=self._collection_name,
-            rows=[
-                {
-                    "id": f"fact:{fact_id}",
-                    "text": f"{safe_subject} {safe_predicate} {object_text}",
-                    "metadata": {
-                        "fact_id": fact_id,
-                        "subject": safe_subject,
-                        "predicate": safe_predicate,
-                        "source": safe_source,
-                        "confidence": safe_confidence,
-                        "timestamp": valid_from_text,
-                    },
-                }
-            ],
-        )
         return {
             "id": fact_id,
             "timestamp": valid_from_text,
@@ -241,34 +207,6 @@ class ArchivalMemory:
             for fact_id, subject, predicate, obj, source, confidence, metadata_raw, valid_from in rows
         ]
 
-    def _fetch_facts_by_ids(self, ids: list[int]) -> dict[int, dict[str, Any]]:
-        if not ids:
-            return {}
-        placeholders = ", ".join(["%s"] * len(ids))
-        rows = self._db.execute(
-            f"""
-            SELECT id, subject, predicate, object, source, confidence, metadata_json, valid_from
-            FROM facts
-            WHERE id IN ({placeholders})
-            """,
-            tuple(ids),
-            fetch="all",
-        ) or []
-        result: dict[int, dict[str, Any]] = {}
-        for fact_id, subject, predicate, obj, source, confidence, metadata_raw, valid_from in rows:
-            key = int(fact_id)
-            result[key] = {
-                "id": key,
-                "timestamp": str(valid_from.isoformat() if hasattr(valid_from, "isoformat") else valid_from or ""),
-                "subject": str(subject or ""),
-                "predicate": str(predicate or ""),
-                "object": obj,
-                "source": str(source or ""),
-                "confidence": float(confidence or 0.0),
-                "metadata": _parse_metadata(metadata_raw),
-            }
-        return result
-
     def query(
         self,
         *,
@@ -277,67 +215,42 @@ class ArchivalMemory:
         keyword: str | None = None,
         limit: int = 30,
     ) -> list[dict[str, Any]]:
+        """按 subject/predicate 精确过滤 + 可选 keyword ILIKE 匹配。
+
+        keyword 会对 subject/predicate/object 三个字段做 OR ILIKE 匹配。
+        多关键词分词、同义词展开由上层 (Brain / Domain) 负责。
+        """
         safe_subject = str(subject or "").strip()
         safe_predicate = str(predicate or "").strip()
         safe_keyword = str(keyword or "").strip()
         safe_limit = max(1, min(int(limit), 300))
 
-        if safe_keyword:
-            hits = self._store.query_texts(
-                collection=self._collection_name,
-                query=safe_keyword,
-                top_k=max(safe_limit * 4, 20),
-                min_similarity=0.0,
-            )
-            ordered_ids: list[int] = []
-            similarity_map: dict[int, float] = {}
-            for hit in hits:
-                metadata = dict(hit.get("metadata") or {})
-                if safe_subject and str(metadata.get("subject") or "") != safe_subject:
-                    continue
-                if safe_predicate and str(metadata.get("predicate") or "") != safe_predicate:
-                    continue
-                fact_id_raw = metadata.get("fact_id")
-                if fact_id_raw is None:
-                    continue
-                fact_id = int(fact_id_raw)
-                if fact_id in similarity_map:
-                    continue
-                similarity_map[fact_id] = float(hit.get("similarity") or 0.0)
-                ordered_ids.append(fact_id)
-                if len(ordered_ids) >= safe_limit:
-                    break
-            rows_map = self._fetch_facts_by_ids(ordered_ids)
-            items: list[dict[str, Any]] = []
-            for fact_id in ordered_ids:
-                item = rows_map.get(fact_id)
-                if not item:
-                    continue
-                item["similarity"] = similarity_map.get(fact_id, 0.0)
-                items.append(item)
-            return items
-
-        sql = """
-            SELECT id, subject, predicate, object, source, confidence, metadata_json, valid_from
-            FROM facts
-            WHERE 1=1
-        """
+        where: list[str] = ["1=1"]
         params: list[Any] = []
+
         if safe_subject:
-            sql += " AND subject = %s"
+            where.append("subject = %s")
             params.append(safe_subject)
         if safe_predicate:
-            sql += " AND predicate = %s"
+            where.append("predicate = %s")
             params.append(safe_predicate)
-        sql += " ORDER BY created_at DESC LIMIT %s"
+        if safe_keyword:
+            where.append('(subject ILIKE %s OR predicate ILIKE %s OR "object" ILIKE %s)')
+            pattern = f"%{safe_keyword}%"
+            params.extend([pattern, pattern, pattern])
+
+        sql = (
+            "SELECT id, subject, predicate, object, source, confidence, metadata_json, valid_from "
+            "FROM facts WHERE " + " AND ".join(where) + " ORDER BY created_at DESC LIMIT %s"
+        )
         params.append(safe_limit)
         rows = self._db.execute(sql, tuple(params), fetch="all") or []
         return [
             {
                 "id": int(fact_id),
                 "timestamp": str(valid_from.isoformat() if hasattr(valid_from, "isoformat") else valid_from or ""),
-                "subject": str(safe_subject_value or ""),
-                "predicate": str(safe_predicate_value or ""),
+                "subject": str(subject_value or ""),
+                "predicate": str(predicate_value or ""),
                 "object": obj,
                 "source": str(source_value or ""),
                 "confidence": float(confidence_value or 0.0),
@@ -345,11 +258,81 @@ class ArchivalMemory:
             }
             for (
                 fact_id,
-                safe_subject_value,
-                safe_predicate_value,
+                subject_value,
+                predicate_value,
                 obj,
                 source_value,
                 confidence_value,
+                metadata_raw,
+                valid_from,
+            ) in rows
+        ]
+
+    def search_keyword(
+        self,
+        *,
+        keywords: list[str] | str,
+        top_k: int = 20,
+        subject: str | None = None,
+        predicate: str | None = None,
+        match: str = "any",
+    ) -> list[dict[str, Any]]:
+        """Agentic search：跨 subject/predicate/object 做多关键词 ILIKE。
+
+        match="any" (默认): 任一关键词命中；"all" 所有关键词都命中。
+        """
+        if isinstance(keywords, str):
+            kw_list = [keywords]
+        else:
+            kw_list = [str(k).strip() for k in keywords if str(k or "").strip()]
+        if not kw_list:
+            return []
+
+        safe_top_k = max(1, min(int(top_k), 200))
+        match_mode = "all" if str(match).strip().lower() == "all" else "any"
+        joiner = " AND " if match_mode == "all" else " OR "
+
+        where: list[str] = []
+        params: list[Any] = []
+
+        kw_clauses: list[str] = []
+        for kw in kw_list:
+            kw_clauses.append('(subject ILIKE %s OR predicate ILIKE %s OR "object" ILIKE %s)')
+            pattern = f"%{kw}%"
+            params.extend([pattern, pattern, pattern])
+        where.append("(" + joiner.join(kw_clauses) + ")")
+
+        if str(subject or "").strip():
+            where.append("subject = %s")
+            params.append(str(subject).strip())
+        if str(predicate or "").strip():
+            where.append("predicate = %s")
+            params.append(str(predicate).strip())
+
+        sql = (
+            "SELECT id, subject, predicate, object, source, confidence, metadata_json, valid_from "
+            "FROM facts WHERE " + " AND ".join(where) + " ORDER BY created_at DESC LIMIT %s"
+        )
+        params.append(safe_top_k)
+        rows = self._db.execute(sql, tuple(params), fetch="all") or []
+        return [
+            {
+                "id": int(fact_id),
+                "timestamp": str(valid_from.isoformat() if hasattr(valid_from, "isoformat") else valid_from or ""),
+                "subject": str(subj_value or ""),
+                "predicate": str(pred_value or ""),
+                "object": obj,
+                "source": str(source_value or ""),
+                "confidence": float(conf_value or 0.0),
+                "metadata": _parse_metadata(metadata_raw),
+            }
+            for (
+                fact_id,
+                subj_value,
+                pred_value,
+                obj,
+                source_value,
+                conf_value,
                 metadata_raw,
                 valid_from,
             ) in rows

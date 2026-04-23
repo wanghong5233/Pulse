@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 class _LLMIntentOutput(BaseModel):
@@ -31,7 +34,20 @@ def _normalize(text: str) -> str:
 
 
 class IntentRouter:
-    """Intent resolver with exact, prefix, and LLM fallback stages."""
+    """Intent resolver with exact, prefix, and slash-command LLM fallback stages.
+
+    **Scope (first-principle)**: 这是 *legacy slash-command* 路由器, 不是自然语言
+    意图识别器. 职责是把 ``/email process`` / ``/intel interview collect`` 这类
+    **command-style 前缀输入**路由到对应业务 target. 自然语言输入(例如
+    "帮我投递 5 个 JD") 应该**直接交给 Brain** 的 ReAct + tool-use 机制决定,
+    不在这里做 LLM 意图猜测:
+      - 准确率低 (``router_rules.json`` 缺失 job.* 时会误分到 intel.interview.collect)
+      - 多花一次 classification LLM 调用 (3s+)
+      - 结果通常被 Brain 忽略, 只制造 trace 噪声
+
+    因此 ``_resolve_with_llm`` **只在输入看起来是 slash-command 但 exact/prefix
+    规则未命中时触发**, 自然语言输入不会触发. 见 docs/Pulse-内核架构总览.md.
+    """
 
     def __init__(
         self,
@@ -93,9 +109,17 @@ class IntentRouter:
                     reason=f"prefix matched: {prefix}",
                 )
 
-        llm_result = self._resolve_with_llm(text)
-        if llm_result is not None:
-            return llm_result
+        # 只对"看起来像命令"的输入尝试 LLM 意图猜测.
+        # 这里的命令启发式是保守的: 必须以 `/` / `!` 开头, 或全是拉丁英文命令 token
+        # (如 ``ping`` / ``email process``) 且 ≤ 6 个词. 绝大多数自然语言句子
+        # (含中文、标点、长度 > 6 词)都不满足, 直接走 fallback → Brain.
+        if self._looks_like_command(normalized):
+            llm_result = self._resolve_with_llm(text)
+            if llm_result is not None:
+                return llm_result
+            fallback_reason = "command-like but no rule/llm match"
+        else:
+            fallback_reason = "natural-language input: defer to Brain"
 
         fallback_intent = _normalize(self._fallback_intent)
         return RouteDecision(
@@ -103,8 +127,30 @@ class IntentRouter:
             target=self._intent_targets.get(fallback_intent, self._fallback_target),
             method="fallback",
             confidence=0.2,
-            reason="no exact/prefix/llm match",
+            reason=fallback_reason,
         )
+
+    @staticmethod
+    def _looks_like_command(normalized_text: str) -> bool:
+        """Heuristic: 判断输入是否是 slash-command 风格指令.
+
+        保守规则 (宁缺毋滥, 不确定就 False → 交给 Brain):
+          * 以 ``/`` 或 ``!`` 开头
+          * 或者: 全是 ASCII 英文 + 空格 + ``./-_``, 且总词数 ≤ 6 (像 ``ping``
+            / ``email process`` / ``intel interview collect``)
+        """
+        text = str(normalized_text or "").strip()
+        if not text:
+            return False
+        if text[0] in ("/", "!"):
+            return True
+        if not text.isascii():
+            return False
+        tokens = text.split()
+        if len(tokens) > 6:
+            return False
+        allowed = set("abcdefghijklmnopqrstuvwxyz0123456789._- ")
+        return all(ch in allowed for ch in text)
 
     def _resolve_with_llm(self, text: str) -> RouteDecision | None:
         if self._llm_router is None:
@@ -120,7 +166,12 @@ class IntentRouter:
         )
         try:
             output = self._llm_router.invoke_structured(prompt, _LLMIntentOutput, route="classification")
-        except Exception:
+        except Exception as exc:   # noqa: BLE001
+            logger.warning(
+                "IntentRouter LLM fallback failed (command-like input), "
+                "defer to rule fallback: %s: %s",
+                type(exc).__name__, str(exc)[:200],
+            )
             return None
 
         candidate_intent = _normalize(getattr(output, "intent", ""))
@@ -129,7 +180,7 @@ class IntentRouter:
         confidence_raw = getattr(output, "confidence", 0.0)
         try:
             confidence = max(0.0, min(float(confidence_raw), 1.0))
-        except Exception:
+        except (TypeError, ValueError):
             confidence = 0.5
         reason = str(getattr(output, "reason", "") or "llm selected")
         return RouteDecision(

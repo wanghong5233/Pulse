@@ -3,7 +3,7 @@ from __future__ import annotations
 from pulse.core.learning import DPOCollector, PreferenceExtractor
 from pulse.core.memory import ArchivalMemory, CoreMemory
 from pulse.core.soul import SoulEvolutionEngine, SoulGovernance
-from tests.pulse.support.fakes import FakeArchivalDB, FakeCorrectionsDB, FakeVectorStore
+from tests.pulse.support.fakes import FakeArchivalDB, FakeCorrectionsDB
 
 
 def test_evolution_engine_applies_preference_and_archives_fact(tmp_path) -> None:
@@ -12,7 +12,7 @@ def test_evolution_engine_applies_preference_and_archives_fact(tmp_path) -> None
         soul_config_path=str(tmp_path / "soul.yaml"),
     )
     governance = SoulGovernance(core_memory=core, audit_path=str(tmp_path / "audit.json"))
-    archival = ArchivalMemory(db_engine=FakeArchivalDB(), vector_store=FakeVectorStore(hit_score=0.96, miss_score=0.35))
+    archival = ArchivalMemory(db_engine=FakeArchivalDB())
     dpo_collector = DPOCollector(db_engine=FakeCorrectionsDB())
     engine = SoulEvolutionEngine(
         governance=governance,

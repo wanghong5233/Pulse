@@ -35,8 +35,6 @@ def postgres_test_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     monkeypatch.delenv("PULSE_BOSS_PROVIDER", raising=False)
     monkeypatch.delenv("PULSE_BOSS_MCP_BASE_URL", raising=False)
     monkeypatch.delenv("PULSE_BOSS_OPENAPI_BASE_URL", raising=False)
-    monkeypatch.setenv("PULSE_EMBEDDING_PROVIDER", "deterministic")
-    monkeypatch.setenv("PULSE_CHROMA_DIR", str(tmp_path / "chroma_db"))
     monkeypatch.setenv("PULSE_CORE_MEMORY_PATH", str(tmp_path / "core_memory.json"))
     monkeypatch.setenv("PULSE_GOVERNANCE_AUDIT_PATH", str(tmp_path / "governance_audit.json"))
     monkeypatch.setenv("PULSE_GOVERNANCE_RULES_VERSIONS_PATH", str(tmp_path / "governance_rules_versions.json"))
@@ -47,6 +45,14 @@ def postgres_test_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     monkeypatch.setenv("PULSE_BOSS_ALLOW_LOCAL_INBOX_FALLBACK", "false")
     monkeypatch.setenv("PULSE_BOSS_MCP_SCAN_MODE", "browser_only")
     monkeypatch.setenv("PULSE_BOSS_MCP_PULL_MODE", "browser_only")
+    # Test runtime must not open real WeCom long-connections.
+    monkeypatch.delenv("WECHAT_WORK_BOT_ID", raising=False)
+    monkeypatch.delenv("WECHAT_WORK_BOT_SECRET", raising=False)
+    monkeypatch.delenv("WECHAT_WORK_CORP_ID", raising=False)
+    monkeypatch.delenv("WECHAT_WORK_AGENT_ID", raising=False)
+    monkeypatch.delenv("WECHAT_WORK_SECRET", raising=False)
+    monkeypatch.delenv("WECHAT_WORK_TOKEN", raising=False)
+    monkeypatch.delenv("WECHAT_WORK_ENCODING_AES_KEY", raising=False)
     if not _database_available(database_url):
         pytest.skip(f"requires PostgreSQL test database: {database_url}")
     return database_url

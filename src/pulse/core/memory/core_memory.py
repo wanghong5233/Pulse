@@ -1,13 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from ..event_types import EventTypes, make_payload
+from ..logging_config import get_trace_id
 
 logger = logging.getLogger(__name__)
+
+EventEmitter = Callable[[str, dict[str, Any]], None]
+
+
+def _content_hash(value: Any) -> str:
+    try:
+        data = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    except (TypeError, ValueError):
+        data = str(value).encode("utf-8", errors="replace")
+    return hashlib.sha256(data).hexdigest()[:16]
 
 
 def _repo_root() -> Path:
@@ -83,6 +97,7 @@ class CoreMemory:
         *,
         storage_path: str | None = None,
         soul_config_path: str | None = None,
+        event_emitter: EventEmitter | None = None,
     ) -> None:
         default_storage = Path.home() / ".pulse" / "core_memory.json"
         self._storage_path = _resolve_path(storage_path, default_path=default_storage)
@@ -93,6 +108,24 @@ class CoreMemory:
         self._lock = threading.Lock()
         self._data = self._build_default_data()
         self._load_persisted()
+        self._event_emitter = event_emitter
+
+    def bind_event_emitter(self, emitter: EventEmitter | None) -> None:
+        self._event_emitter = emitter
+
+    def _emit(self, event_type: str, **fields: Any) -> None:
+        emitter = self._event_emitter
+        if emitter is None:
+            return
+        try:
+            payload = make_payload(
+                trace_id=get_trace_id(),
+                actor="core_memory",
+                **fields,
+            )
+            emitter(event_type, payload)
+        except Exception:  # pragma: no cover - 观测侧不阻塞主流程
+            logger.debug("core_memory event emit failed", exc_info=True)
 
     def _build_default_data(self) -> dict[str, Any]:
         default_soul = {
@@ -140,7 +173,11 @@ class CoreMemory:
         return {
             "soul": merged_soul,
             "user": {"name": "", "goals": []},
-            "prefs": {"default_location": "beijing"},
+            # prefs 保持空 dict: CoreMemory 只承载**跨 domain**的通用偏好,
+            # 业务专属字段 (求职城市 / 薪资等) 走各自 Domain Profile, 见
+            # ``src/pulse/modules/job/profile/schema.py`` 与
+            # ``docs/Pulse-DomainMemory与Tool模式.md`` 分层约定。
+            "prefs": {},
             "context": {
                 "beliefs": {
                     "core": core_beliefs or [
@@ -187,12 +224,30 @@ class CoreMemory:
             raise ValueError(f"unsupported core memory block: {key}")
         with self._lock:
             current = self._data.get(key)
+            hash_before = _content_hash(current)
             if merge and isinstance(current, dict) and isinstance(content, dict):
                 self._data[key] = _deep_merge(current, content)
             else:
                 self._data[key] = deepcopy(content)
             self._save()
-            return deepcopy(self._data[key])
+            updated = deepcopy(self._data[key])
+        hash_after = _content_hash(updated)
+        if hash_before != hash_after:
+            logger.info(
+                "core_memory_updated block=%s merge=%s hash=%s->%s",
+                key,
+                merge,
+                hash_before,
+                hash_after,
+            )
+            self._emit(
+                EventTypes.MEMORY_CORE_UPDATED,
+                block=key,
+                merge=merge,
+                hash_before=hash_before,
+                hash_after=hash_after,
+            )
+        return updated
 
     def update_preferences(self, updates: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(updates, dict):

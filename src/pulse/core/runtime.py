@@ -24,6 +24,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from .hooks import HookPoint, HookRegistry
+from .logging_config import set_trace_id
 from .scheduler import BackgroundSchedulerRunner, ScheduleTask
 from .scheduler.windows import is_active_hour
 from .task_context import (
@@ -232,7 +233,7 @@ class AgentRuntime:
         handler: Callable[[TaskContext], Any],
         peak_interval: int,
         offpeak_interval: int,
-        enabled: bool = True,
+        enabled: bool = False,
         active_hours_only: bool = True,
         workspace_id: str | None = None,
         token_budget: int = 4000,
@@ -242,6 +243,14 @@ class AgentRuntime:
         This is the **only** coupling point between modules and the Runtime.
         The Runtime treats every task identically — it does not interpret
         the task name or know what the handler does.
+
+        ``enabled`` defaults to ``False`` by design (ADR-004 §6.1.1): the
+        module's ``on_startup`` must register patrols **unconditionally** so
+        the conversational control plane can see them; the user flips them on
+        later through ``system.patrol.enable`` over IM. Tests and internal
+        tasks that need "registered AND running immediately" may pass
+        ``enabled=True`` explicitly — a test-friendly escape hatch, never a
+        production code path.
 
         Handler signature: ``handler(ctx: TaskContext) -> Any``
         """
@@ -301,6 +310,36 @@ class AgentRuntime:
             token_budget=token_budget,
         )
         ctx.start_clock()
+        # ADR-005 §2 bind patrol trace_id to this thread's ContextVar so
+        # every downstream logger (stage events, connector._invoke,
+        # mcp_transport_http._open_response) picks it up. Without this the
+        # cross-process header `X-Pulse-Trace-Id` never gets injected and
+        # boss_mcp.log drops into the "-" sink — which is exactly the gap
+        # the 2026-04-22 post-mortem exposed (see ADR-005 changelog).
+        # Reset in finally so a reused scheduler worker thread cannot leak
+        # the trace to an unrelated next job.
+        set_trace_id(ctx.trace_id)
+        try:
+            self._execute_patrol_body(ctx, name, handler)
+        finally:
+            set_trace_id(None)
+
+    def _execute_patrol_body(
+        self,
+        ctx: TaskContext,
+        name: str,
+        handler: Callable[[TaskContext], Any],
+    ) -> None:
+        """Inner body of ``_execute_patrol`` — extracted to keep the
+        ``set_trace_id`` try/finally wrapper tight.
+
+        Why split: the original body has ~6 early-return branches (takeover
+        guard / circuit breaker / backoff / hook block / ...). Wrapping all
+        of them directly in a try/finally around the full method would
+        work, but this split makes the "trace bind" contract visually
+        explicit at the single call site and ensures the reset runs on
+        every path (including uncaught exceptions from ``handler``).
+        """
         stats = self._patrol_stats.get(name, {})
 
         # Stage -1: Takeover guard — human_control/paused 时跳过 patrol（heartbeat 除外）
@@ -608,6 +647,98 @@ class AgentRuntime:
         })
         return True
 
+    # -- per-patrol control plane (ADR-004 §6.1) ----------------------------
+
+    def list_patrols(self) -> list[dict[str, Any]]:
+        """Snapshot every module-registered patrol. Internal heartbeat
+        is excluded — it is not a user-controllable patrol (ADR-004 §6.1.7
+        invariant #1).
+        """
+        out: list[dict[str, Any]] = []
+        for name in self._runner.engine.list_tasks():
+            if name == self._heartbeat_task_name:
+                continue
+            snapshot = self._patrol_snapshot(name)
+            if snapshot is not None:
+                out.append(snapshot)
+        return out
+
+    def get_patrol_stats(self, name: str) -> dict[str, Any] | None:
+        """Snapshot a single patrol; ``None`` if unknown or is internal
+        heartbeat. Callers treat ``None`` as fail-loud (not found)."""
+        if name == self._heartbeat_task_name:
+            return None
+        return self._patrol_snapshot(name)
+
+    def enable_patrol(self, name: str) -> bool:
+        """Turn a patrol ON at runtime. Returns True on success, False if
+        unknown or is internal heartbeat. Emits
+        ``runtime.patrol.lifecycle.enabled`` on success.
+        """
+        if name == self._heartbeat_task_name:
+            return False
+        ok = self._runner.engine.set_enabled(name, True)
+        if ok:
+            self._emit("runtime.patrol.lifecycle.enabled", {"task_name": name})
+            logger.info("Patrol enabled: %s", name)
+        return ok
+
+    def disable_patrol(self, name: str) -> bool:
+        """Turn a patrol OFF at runtime. Returns True on success, False if
+        unknown or is internal heartbeat. Emits
+        ``runtime.patrol.lifecycle.disabled`` on success.
+        """
+        if name == self._heartbeat_task_name:
+            return False
+        ok = self._runner.engine.set_enabled(name, False)
+        if ok:
+            self._emit("runtime.patrol.lifecycle.disabled", {"task_name": name})
+            logger.info("Patrol disabled: %s", name)
+        return ok
+
+    def run_patrol_once(self, name: str) -> dict[str, Any]:
+        """Execute one tick of a patrol right now, bypassing interval
+        gating. Blocks until the patrol handler returns. Full 5-stage
+        pipeline (including circuit-breaker L0 skip) still applies —
+        ADR-004 §6.1.7 invariant #3.
+        """
+        if name == self._heartbeat_task_name:
+            return {"ok": False, "error": "internal heartbeat is not controllable"}
+        entry = self._patrol_handlers.get(name)
+        if entry is None:
+            return {"ok": False, "error": f"patrol not found: {name}"}
+        handler, workspace_id, token_budget = entry
+        self._emit("runtime.patrol.lifecycle.triggered", {"task_name": name})
+        self._execute_patrol(
+            name,
+            handler,
+            workspace_id=workspace_id,
+            token_budget=token_budget,
+        )
+        stats = self._patrol_stats.get(name, {})
+        return {
+            "ok": True,
+            "task_name": name,
+            "last_outcome": stats.get("last_outcome"),
+            "last_run_at": stats.get("last_run_at"),
+            "last_trace_id": stats.get("last_trace_id"),
+            "last_error": stats.get("last_error"),
+        }
+
+    def _patrol_snapshot(self, name: str) -> dict[str, Any] | None:
+        task = self._runner.engine.get_task(name)
+        if task is None:
+            return None
+        stats = self._patrol_stats.get(name, {})
+        return {
+            "name": name,
+            "enabled": bool(task.enabled),
+            "peak_interval_seconds": task.peak_interval_seconds,
+            "offpeak_interval_seconds": task.offpeak_interval_seconds,
+            "active_hours_only": bool(task.active_hours_only),
+            "stats": dict(stats),
+        }
+
     def status(self) -> dict[str, Any]:
         runner_status = self._runner.status()
         return {
@@ -747,11 +878,22 @@ class AgentRuntime:
 
         elapsed_ms = ctx.elapsed_ms()
 
-        # Stage 5: 检查到期 patrol 并触发（heartbeat 作为完整 Agent Turn）
+        # Stage 5: 触发到期 patrol —— 必须尊重 ScheduleTask.enabled。
+        # ADR-004 §6.1.1 规定启停是 IM 独占的单一认知路径
+        # (system.patrol.enable/disable → engine.set_enabled)。
+        # 以前这里直接遍历 _patrol_handlers, 绕过 enabled 检查, 把
+        # register_patrol(enabled=False) 的保证打穿 —— 结果是用户只
+        # 开 job_chat.patrol, heartbeat 每分钟还是帮他跑一次
+        # job_greet.patrol, 浏览器反复跳去搜索页 scan+打分但又因
+        # confirm_execute=False 不真发打招呼。典型的 ghost tick。
         triggered_patrols: list[str] = []
         if is_active and self._takeover_state == TakeoverState.autonomous:
+            engine = self._runner.engine
             for name, entry in self._patrol_handlers.items():
                 if name == self._heartbeat_task_name:
+                    continue
+                task = engine.get_task(name)
+                if task is None or not task.enabled:
                     continue
                 stats = self._patrol_stats.get(name, {})
                 if stats.get("circuit_open"):
@@ -790,10 +932,16 @@ class AgentRuntime:
         """
         hb_result = self.heartbeat()
 
-        # 即时触发所有非熔断的 patrol
+        # 即时触发所有非熔断 + 已 enable 的 patrol。
+        # 同 heartbeat Stage 5 的契约: enabled 是单一认知路径,
+        # manual_wake 不是授权通道, 不得跑用户没开的 patrol。
         triggered: list[str] = []
+        engine = self._runner.engine
         for name, stats in self._patrol_stats.items():
             if stats.get("circuit_open"):
+                continue
+            task = engine.get_task(name)
+            if task is None or not task.enabled:
                 continue
             entry = self._patrol_handlers.get(name)
             if entry is None:

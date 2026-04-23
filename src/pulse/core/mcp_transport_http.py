@@ -6,7 +6,11 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from .logging_config import get_trace_id
 from .mcp_client import MCPTool
+
+
+TRACE_HEADER = "X-Pulse-Trace-Id"
 
 
 class _MCPHTTPTransportError(RuntimeError):
@@ -37,7 +41,23 @@ class HttpMCPTransport:
         if safe_mode not in self._HTTP_MODES:
             raise ValueError(f"unsupported HTTP MCP transport_mode: {transport_mode}")
         self._base_url = safe_base
-        self._timeout_sec = max(1.0, min(float(timeout_sec), 30.0))
+        # ADR-005 §7.4 post-mortem: a 30s silent upper bound here made
+        # ``BossMcpSettings.timeout_sec`` (default=90, le=180) **completely
+        # ineffective** — any tool handler that runs longer than 30s on the
+        # gateway side (pull_conversations, scan_jobs — anything that drives
+        # a playwright page) reliably hit `urlopen` timeout, the connector
+        # retried, and two or more handlers raced on the same browser page.
+        # That is how the user's auto-reply patrol spent 65s per turn yet
+        # returned rows=0 every time (2026-04-22 real run). Trust the caller
+        # — pydantic settings already bound the value — but fail-loud on
+        # obviously broken inputs instead of silently truncating.
+        safe_timeout = float(timeout_sec)
+        if not (1.0 <= safe_timeout <= 600.0):
+            raise ValueError(
+                f"timeout_sec out of allowed range [1.0, 600.0]: got {timeout_sec!r}. "
+                "Bind at caller side via schema (see BossMcpSettings.timeout_sec)."
+            )
+        self._timeout_sec = safe_timeout
         self._auth_token = str(auth_token or "").strip()
         self._transport_mode = "auto" if safe_mode == "http" else safe_mode
         self._protocol_version = str(protocol_version or self.DEFAULT_PROTOCOL_VERSION).strip() or self.DEFAULT_PROTOCOL_VERSION
@@ -375,6 +395,12 @@ class HttpMCPTransport:
             headers["MCP-Protocol-Version"] = self._protocol_version
         if include_session and self._session_id:
             headers["Mcp-Session-Id"] = self._session_id
+        # ADR-005 §2: forward the caller's trace_id so the remote MCP
+        # process can tag its logs + per-trace bucket accordingly.
+        # "-" is the sentinel "no trace bound"; don't leak it as a header.
+        current_trace = get_trace_id()
+        if current_trace and current_trace != "-":
+            headers[TRACE_HEADER] = current_trace
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(

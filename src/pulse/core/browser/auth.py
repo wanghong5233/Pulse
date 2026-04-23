@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
+
+logger = logging.getLogger(__name__)
 
 EmitFunc = Callable[[str, str, dict[str, Any] | None], None]
 NotifyFunc = Callable[[], None]
@@ -28,8 +31,8 @@ def check_login_required(
         locator = page.locator(login_selector)
         if locator.count() > 0:
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("check_login_required probe swallowed exception: %s", exc)
     return False
 
 
@@ -62,19 +65,29 @@ def handle_cookie_expired(
             page.screenshot(path=str(screenshot_path))
             if emit is not None:
                 emit("browser_screenshot", "Cookie 过期截图", {"path": str(screenshot_path)})
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "handle_cookie_expired screenshot failed (operation=%s): %s",
+                operation, exc,
+            )
             screenshot_path = None
 
     if notify is not None:
         try:
             notify()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "handle_cookie_expired notify failed (operation=%s): %s",
+                operation, exc,
+            )
 
     if reset_session is not None:
         try:
             reset_session()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "handle_cookie_expired reset_session failed (operation=%s): %s",
+                operation, exc,
+            )
 
     return screenshot_path

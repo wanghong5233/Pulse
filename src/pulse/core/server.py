@@ -4,6 +4,7 @@ import csv
 import inspect
 import io
 import json
+import logging
 import os
 import time
 import uuid
@@ -17,12 +18,14 @@ from fastapi.responses import StreamingResponse
 
 from ..tools import register_builtin_tools
 from .brain import Brain
-from .channel import CliChannelAdapter, FeishuChannelAdapter, IncomingMessage, verify_feishu_signature
+from .verifier import CommitmentVerifier
+from .channel import CliChannelAdapter, FeishuChannelAdapter, IncomingMessage, OutgoingMessage, verify_feishu_signature, WechatWorkChannelAdapter, WechatWorkBotAdapter
 from .config import get_settings
 from .cost import CostController
 from .evolution_config import build_evolution_governance_options
 from .events import EventBus, InMemoryEventStore
-from .learning import DPOCollector, PreferenceExtractor
+from .event_sinks import JsonlEventSink
+from .learning import DomainPreferenceDispatcher, DPOCollector, PreferenceExtractor
 from .learning.behavior_analyzer import BehaviorAnalyzer
 from .llm.router import LLMRouter
 from .memory import ArchivalMemory, CoreMemory, RecallMemory, register_memory_tools
@@ -34,6 +37,7 @@ from .mcp_servers_config import load_mcp_servers, pick_preferred_http_server
 from .mcp_transport_http import HttpMCPTransport
 from .mcp_transport_stdio import StdioMCPTransport
 from .module import ModuleRegistry
+from .profile import ProfileCoordinator
 from .runtime import AgentRuntime, RuntimeConfig
 from .task_context import create_interactive_context
 from .prompt_contract import PromptContractBuilder
@@ -45,8 +49,14 @@ from .policy_config import build_policy_engine
 from .router_config import build_intent_router
 from .skill_generator import SkillGenerator
 from .storage.engine import DatabaseEngine
-from .storage.vector import LocalVectorStore
 from .soul import GovernanceRulesVersionStore, SoulEvolutionEngine, SoulGovernance
+from .startup_check import (
+    StartupReport,
+    check_channel_wechat_bot,
+    check_mcp_transport,
+    check_and_abort,
+    emit_report,
+)
 from .tool import ToolRegistry
 
 
@@ -56,6 +66,7 @@ def _build_configured_mcp_transport(settings: Any) -> MCPTransport | None:
     preferred_server = str(getattr(settings, "mcp_preferred_server", "") or "").strip()
     configured_servers = load_mcp_servers(config_path)
     chosen = pick_preferred_http_server(configured_servers, preferred_name=preferred_server)
+    _log = logging.getLogger(__name__)
     if chosen is not None:
         try:
             return HttpMCPTransport(
@@ -64,8 +75,11 @@ def _build_configured_mcp_transport(settings: Any) -> MCPTransport | None:
                 auth_token=chosen.auth_token,
                 transport_mode=chosen.transport,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.error(
+                "MCP transport build failed for preferred server '%s' (url=%s mode=%s): %s",
+                chosen.name, chosen.url, chosen.transport, exc,
+            )
 
     base_url = str(getattr(settings, "mcp_http_base_url", "") or "").strip()
     if not base_url:
@@ -78,15 +92,32 @@ def _build_configured_mcp_transport(settings: Any) -> MCPTransport | None:
             timeout_sec=timeout_sec,
             auth_token=auth_token,
         )
-    except Exception:
+    except Exception as exc:
+        _log.error(
+            "MCP transport build failed for env base_url=%s: %s",
+            base_url, exc,
+        )
         return None
 
 
-def _build_all_mcp_transports(settings: Any) -> dict[str, MCPTransport]:
-    """Build transports for all configured MCP servers (http + stdio)."""
+def _build_all_mcp_transports(
+    settings: Any,
+    *,
+    report: "StartupReport | None" = None,
+) -> dict[str, MCPTransport]:
+    """Build transports for all configured MCP servers (http + stdio).
+
+    Fail-fast 原则: 单个 server 构造失败不应拖垮整个 Pulse 启动 (MCP 只是工具面,
+    降级到无工具模式仍可对话), 但**必须显式记录**, 由 startup self-check 汇总
+    展示给用户. 不允许 ``except Exception: pass`` 静默吞.
+
+    可选的 ``report`` 参数用于把每个 server 的构造结果 (ready / failed) 汇总
+    到启动健康面板 —— 参见 ``startup_check.check_mcp_transport``.
+    """
     config_path = str(getattr(settings, "mcp_servers_config_path", "") or "").strip()
     configured_servers = load_mcp_servers(config_path)
     transports: dict[str, MCPTransport] = {}
+    _log = logging.getLogger(__name__)
     for cfg in configured_servers:
         try:
             if cfg.transport == "stdio":
@@ -97,6 +128,8 @@ def _build_all_mcp_transports(settings: Any) -> dict[str, MCPTransport]:
                     env=cfg.env,
                     timeout_sec=cfg.timeout_sec,
                 )
+                if report is not None:
+                    report.add(check_mcp_transport(name=cfg.name, built=True, url=""))
             elif cfg.transport in {"http", "streamable_http", "http_sse", "sse", "legacy_sse"} and cfg.url:
                 transports[cfg.name] = HttpMCPTransport(
                     base_url=cfg.url,
@@ -104,8 +137,27 @@ def _build_all_mcp_transports(settings: Any) -> dict[str, MCPTransport]:
                     auth_token=cfg.auth_token,
                     transport_mode=cfg.transport,
                 )
-        except Exception:
-            pass
+                if report is not None:
+                    report.add(check_mcp_transport(name=cfg.name, built=True, url=cfg.url))
+            else:
+                _log.warning(
+                    "MCP server '%s' skipped: unsupported transport='%s' url=%s",
+                    cfg.name, cfg.transport, cfg.url,
+                )
+                if report is not None:
+                    report.add(check_mcp_transport(
+                        name=cfg.name, built=False, url=cfg.url,
+                        error=f"unsupported transport='{cfg.transport}'",
+                    ))
+        except Exception as exc:
+            _log.error(
+                "MCP transport build failed for '%s' (transport=%s url=%s): %s",
+                cfg.name, cfg.transport, cfg.url, exc,
+            )
+            if report is not None:
+                report.add(check_mcp_transport(
+                    name=cfg.name, built=False, url=cfg.url, error=str(exc)[:120],
+                ))
     return transports
 
 
@@ -115,6 +167,10 @@ def create_app(
     mcp_transport: MCPTransport | None = None,
     skill_output_dir_override: str | None = None,
 ) -> FastAPI:
+    from .logging_config import set_trace_id, setup_logging
+    setup_logging()
+    logger = logging.getLogger(__name__)
+
     settings = get_settings()
     module_registry = ModuleRegistry()
     module_registry.discover("pulse.modules")
@@ -145,17 +201,8 @@ def create_app(
         soul_config_path=settings.soul_config_path,
     )
     storage_engine = DatabaseEngine()
-    vector_store = LocalVectorStore()
-    recall_memory = RecallMemory(
-        collection_name=settings.recall_collection_name,
-        db_engine=storage_engine,
-        vector_store=vector_store,
-    )
-    archival_memory = ArchivalMemory(
-        collection_name=settings.archival_collection_name,
-        db_engine=storage_engine,
-        vector_store=vector_store,
-    )
+    recall_memory = RecallMemory(db_engine=storage_engine)
+    archival_memory = ArchivalMemory(db_engine=storage_engine)
     workspace_memory = WorkspaceMemory(db_engine=storage_engine)
 
     def _governance_overrides_from_env() -> tuple[str | None, dict[str, str]]:
@@ -198,10 +245,18 @@ def create_app(
     )
     dpo_collector = DPOCollector(db_engine=storage_engine)
     preference_extractor = PreferenceExtractor(llm_router=llm_router)
+    # DomainPreferenceDispatcher 把"自然语言业务偏好 → DomainMemory"从
+    # "靠 LLM 调对工具"改成"reflection 架构强制持久化". 每个业务 module
+    # 通过 BaseModule.get_preference_appliers() 注册自己的 applier, 这里
+    # 先实例化一个空 dispatcher, 稍后遍历 module_registry 收集注册.
+    # 发事件能力 (preference.domain.*) 与其它 EventBus 消费者一起在 ready
+    # 时绑定, 见下文 ``evolution_engine.bind_domain_preference_dispatcher``.
+    domain_preference_dispatcher = DomainPreferenceDispatcher()
     evolution_engine = SoulEvolutionEngine(
         governance=governance,
         archival_memory=archival_memory,
         preference_extractor=preference_extractor,
+        domain_preference_dispatcher=domain_preference_dispatcher,
         dpo_collector=dpo_collector,
         dpo_auto_collect=False,
     )
@@ -218,8 +273,12 @@ def create_app(
             name=str(module_tool["name"]),
             handler=module_tool["handler"],  # type: ignore[arg-type]
             description=str(module_tool["description"]),
+            when_to_use=str(module_tool.get("when_to_use") or ""),
+            when_not_to_use=str(module_tool.get("when_not_to_use") or ""),
             ring=str(module_tool.get("ring") or "ring2_module"),  # type: ignore[arg-type]
+            schema=dict(module_tool.get("schema") or {}),  # type: ignore[arg-type]
             metadata=dict(module_tool.get("metadata") or {}),
+            extract_facts=module_tool.get("extract_facts"),  # type: ignore[arg-type]
         )
     skill_generator = SkillGenerator(
         tool_registry=tool_registry,
@@ -227,8 +286,11 @@ def create_app(
         llm_router=llm_router,
     )
     cost_controller = CostController(daily_budget_usd=settings.brain_daily_budget_usd)
+    # 启动健康自检: 汇总 channel/MCP/... 的 ready/failed, 在 lifespan startup 阶段打印一张表.
+    # fatal 项 (比如已配置但 SDK 缺的 wechat-bot) 会让进程退出, 拒绝"静默假装在工作".
+    startup_report = StartupReport()
     active_mcp_transport = mcp_transport or _build_configured_mcp_transport(settings)
-    all_transports = _build_all_mcp_transports(settings)
+    all_transports = _build_all_mcp_transports(settings, report=startup_report)
     mcp_client = MCPClient(transport=active_mcp_transport, transports=all_transports)
     approved_external_mcp_tools: set[str] = set()
     external_mcp_aliases: dict[str, tuple[str, str]] = {}
@@ -376,8 +438,20 @@ def create_app(
         archival_memory=archival_memory,
         workspace_memory=workspace_memory,
     )
-    tool_names = [t.name for t in tool_registry.list_tools()]
-    prompt_builder = PromptContractBuilder(memory=memory_reader, tool_names=tool_names)
+    tool_specs = list(tool_registry.list_tools())
+    prompt_builder = PromptContractBuilder(memory=memory_reader, tool_specs=tool_specs)
+    # 收集所有 module 的 domain snapshot provider, 注入 Brain system prompt。
+    # 见 docs/Pulse-DomainMemory与Tool模式.md §3.3 / §5.3。
+    for _mod in module_registry.modules:
+        try:
+            _provider = _mod.get_domain_snapshot_provider()
+        except Exception as _exc:
+            logging.getLogger(__name__).warning(
+                "module %s get_domain_snapshot_provider failed: %s", _mod.name, _exc
+            )
+            continue
+        if _provider is not None:
+            prompt_builder.register_domain_snapshot_provider(_provider)
     hooks = HookRegistry()
 
     def _policy_before_task(hctx: HookContext) -> HookResult:
@@ -450,6 +524,56 @@ def create_app(
     hooks.register(HookPoint.before_tool_use, _policy_before_tool, name="policy.before_tool", priority=20)
     hooks.register(HookPoint.before_promotion, _governance_before_promotion, name="governance.before_promotion", priority=20)
 
+    # ── Domain Profile 运行时 ──
+    # memory 是单一事实源, yaml 是它的实时投影:
+    #   1. 启动: load_all() 让各 domain 用 yaml 种 memory (冷启动)
+    #   2. 运行: after_tool_use hook 在 mutating tool 成功后 rewrite 对应
+    #      domain 的 yaml, 保证 "memory 与 yaml 相等" 的一致性契约
+    # 见 docs/Pulse-DomainMemory与Tool模式.md "Domain Profile 管理" 章节。
+    profile_coordinator = ProfileCoordinator()
+    import logging as _logging  # noqa: PLC0415
+    _profile_logger = _logging.getLogger(__name__)
+    for _mod in module_registry.modules:
+        try:
+            _pm = _mod.get_profile_manager()
+        except Exception as _exc:
+            _profile_logger.warning(
+                "module %s get_profile_manager failed: %s", _mod.name, _exc,
+            )
+            continue
+        if _pm is not None:
+            try:
+                profile_coordinator.register(_pm)
+            except ValueError as _exc:
+                _profile_logger.warning(
+                    "profile register rejected for module %s: %s", _mod.name, _exc,
+                )
+    _profile_logger.info(
+        "profile_coordinator load_all report=%s", profile_coordinator.load_all(),
+    )
+
+    def _profile_after_tool(hctx: HookContext) -> HookResult:
+        payload = dict(hctx.payload or {})
+        if str(payload.get("status") or "") != "ok":
+            return HookResult()
+        tool_name = str(payload.get("tool_name") or "").strip()
+        if not tool_name or "." not in tool_name:
+            return HookResult()
+        # 约定: intent tool 名形如 "<domain>.<capability>.<action>"。
+        # 第一段就是 domain, 与 DomainProfileManager.domain 匹配。
+        domain_seg = tool_name.split(".", 1)[0]
+        if domain_seg in {"module", "mcp", "memory", "core"}:
+            return HookResult()  # 内核/外部 tool, 无对应 profile domain
+        profile_coordinator.sync_one(domain_seg)
+        return HookResult()
+
+    hooks.register(
+        HookPoint.after_tool_use,
+        _profile_after_tool,
+        name="profile.after_tool",
+        priority=200,
+    )
+
     compaction = CompactionEngine()
 
     promotion = PromotionEngine(
@@ -457,6 +581,12 @@ def create_app(
         archival_memory=archival_memory,
         core_memory=core_memory,
     )
+
+    # ToolUseContract C (ADR-001 §4.4): end-of-turn commitment auditor.
+    # Runs on the same LLMRouter as Brain — routes internally via
+    # ``classification`` (gpt-4o-mini tier), kill-switch at
+    # ``PULSE_COMMITMENT_VERIFIER=off``.
+    commitment_verifier = CommitmentVerifier(llm_router=llm_router)
 
     brain = Brain(
         tool_registry=tool_registry,
@@ -474,6 +604,7 @@ def create_app(
         hooks=hooks,
         compaction=compaction,
         promotion=promotion,
+        commitment_verifier=commitment_verifier,
     )
     mcp_server = MCPServerAdapter(tool_registry=tool_registry)
     mcp_sessions: dict[str, dict[str, Any]] = {}
@@ -484,11 +615,54 @@ def create_app(
     channel_adapters = {
         "cli": CliChannelAdapter(),
         "feishu": FeishuChannelAdapter(),
+        "wechat-work": WechatWorkChannelAdapter(
+            corp_id=settings.wechat_work_corp_id,
+            agent_id=settings.wechat_work_agent_id,
+            secret=settings.wechat_work_secret,
+            token=settings.wechat_work_token,
+            encoding_aes_key=settings.wechat_work_encoding_aes_key,
+        ),
+        "wechat-work-bot": WechatWorkBotAdapter(
+            bot_id=settings.wechat_work_bot_id,
+            bot_secret=settings.wechat_work_bot_secret,
+        ),
     }
     event_bus = EventBus()
     event_store = InMemoryEventStore(max_events=settings.event_store_max_events)
     event_bus.subscribe_all(event_store.record)
+    # Observability Plane: append-only 审计 sink (仅持久化 llm.*/tool.*/memory.*/policy.* 等)
+    event_audit_sink = JsonlEventSink(
+        directory=str(getattr(settings, "event_audit_dir", "./data/exports/events")),
+    )
+    event_bus.subscribe_all(event_audit_sink.handle)
     module_registry.bind_event_emitter(event_bus.publish)
+    # 把 event_bus 运行期注入已构造好的核心组件, 使其可以发射 memory.*/llm.* 事件
+    core_memory.bind_event_emitter(event_bus.publish)
+    llm_router.bind_event_emitter(event_bus.publish)
+    brain.bind_event_emitter(event_bus.publish)
+    # DomainPreferenceDispatcher: 发 preference.domain.* 事件 + 收集各 module 注册的 applier
+    domain_preference_dispatcher.bind_event_emitter(event_bus.publish)
+    _domain_applier_logger = logging.getLogger(__name__)
+    for _mod in module_registry.modules:
+        try:
+            _appliers = _mod.get_preference_appliers() or []
+        except Exception as _exc:   # noqa: BLE001
+            _domain_applier_logger.warning(
+                "module %s get_preference_appliers failed: %s", _mod.name, _exc,
+            )
+            continue
+        for _applier in _appliers:
+            try:
+                domain_preference_dispatcher.register(_applier)
+                _domain_applier_logger.info(
+                    "preference applier registered: domain=%s from module=%s",
+                    getattr(_applier, "domain", "?"), _mod.name,
+                )
+            except (ValueError, TypeError) as _exc:
+                _domain_applier_logger.warning(
+                    "module %s applier %r registration failed: %s",
+                    _mod.name, _applier, _exc,
+                )
 
     def _preview(value: Any, *, max_chars: int = 300) -> str:
         if isinstance(value, str):
@@ -529,6 +703,57 @@ def create_app(
             return "", None
         return session_id, mcp_sessions.get(session_id)
 
+    def _write_turn_meta(
+        *,
+        trace_id: str,
+        message: IncomingMessage,
+        brain_result: Any,
+        response: dict[str, Any],
+    ) -> None:
+        """ADR-005 §3: one JSON summary per user turn.
+
+        Dumped to ``logs/traces/<trace_id>/meta.json`` so post-mortem tools
+        can ``cat`` a single file to answer "what happened?" without diffing
+        .log lines.
+        """
+        try:
+            from .logging_config import TRACES_SUBDIR
+
+            log_dir = Path(os.getenv("PULSE_LOG_DIR", "logs"))
+
+            tool_calls: list[dict[str, Any]] = []
+            for step in getattr(brain_result, "steps", []) or []:
+                if getattr(step, "action", "") == "use_tool":
+                    tool_calls.append({
+                        "index": int(getattr(step, "index", 0)),
+                        "tool": str(getattr(step, "tool_name", "") or ""),
+                        "args": dict(getattr(step, "tool_args", {}) or {}),
+                    })
+
+            target_dir = log_dir / TRACES_SUBDIR / trace_id
+            target_dir.mkdir(parents=True, exist_ok=True)
+            meta = {
+                "trace_id": trace_id,
+                "channel": message.channel,
+                "user_id": message.user_id,
+                "user_text": message.text,
+                "latency_ms": int(response.get("latency_ms") or 0),
+                "handled": bool(response.get("handled")),
+                "answer": getattr(brain_result, "answer", "") or "",
+                "used_tools": list(getattr(brain_result, "used_tools", []) or []),
+                "stopped_reason": str(getattr(brain_result, "stopped_reason", "") or ""),
+                "tool_calls": tool_calls,
+                "route": dict(response.get("route") or {}),
+                "policy": dict(response.get("policy") or {}),
+            }
+            (target_dir / "meta.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            # Meta dump is observability, never a hot path: log and carry on.
+            logger.exception("trace.meta.write.failed trace_id=%s", trace_id)
+
     async def _dispatch_channel_message(message: IncomingMessage) -> dict[str, Any]:
         metadata = dict(message.metadata)
         metadata["channel"] = message.channel
@@ -541,7 +766,20 @@ def create_app(
             extra={"channel": message.channel, "user_id": message.user_id},
         )
         trace_id = ctx.trace_id
+        # ADR-005 §1: bind trace_id at the *single entry* of a user turn so
+        # that every downstream ``logger.info`` (channel adapter, brain,
+        # modules, connector, remote boss_mcp via header) lands in the
+        # same per-trace bucket. Without this, earlier logs (policy/route/
+        # router.resolve) get ``trace=-`` and fragment across buckets.
+        set_trace_id(trace_id)
         started_at = time.perf_counter()
+        logger.info(
+            "channel.msg.received channel=%s user=%s text_chars=%d session=%s",
+            message.channel,
+            message.user_id,
+            len(message.text or ""),
+            metadata["session_id"],
+        )
         _emit_event(
             "channel.message.received",
             {
@@ -624,11 +862,16 @@ def create_app(
             return response
 
         metadata["intent"] = route.intent
-        if target_name:
+        # 只有规则/LLM 显式命中 (exact/prefix/llm) 时才把 route_hint 传给 Brain;
+        # method=fallback 的 target 是 IntentRouter 的 fallback_target (通常是 hello),
+        # 自然语言输入走到这里, 把 "intent detected 'general.default' targeting "
+        # module 'hello'" 注进 system message 只会给 LLM 制造误导噪声 (F10).
+        if target_name and route.method in ("exact", "prefix", "llm"):
             metadata["route_hint"] = {
                 "intent": route.intent,
                 "target": target_name,
                 "tool_name": f"module.{target_name}",
+                "method": route.method,
             }
         prefer_llm = settings.brain_prefer_llm
         prefer_llm_raw = metadata.pop("prefer_llm", None)
@@ -744,6 +987,24 @@ def create_app(
                 "latency_ms": response["latency_ms"],
             },
         )
+        logger.info(
+            "channel.msg.completed channel=%s handled=%s used_tools=%s "
+            "steps=%d stopped=%s latency_ms=%d",
+            message.channel,
+            bool(response.get("handled")),
+            list(brain_result.used_tools),
+            len(brain_result.steps),
+            brain_result.stopped_reason,
+            response["latency_ms"],
+        )
+        # ADR-005 §3: per-turn meta.json — one glance tells the whole story
+        # without grepping the .log files.
+        _write_turn_meta(
+            trace_id=trace_id,
+            message=message,
+            brain_result=brain_result,
+            response=response,
+        )
         return response
 
     for adapter in channel_adapters.values():
@@ -770,9 +1031,23 @@ def create_app(
             if inspect.isawaitable(startup_result):
                 await startup_result
         agent_runtime.start()
+
+        wechat_bot: WechatWorkBotAdapter = channel_adapters["wechat-work-bot"]  # type: ignore[assignment]
+        # 先把 channel 状态补进 startup_report (MCP 那几条在 create_app 构造期已入库).
+        startup_report.add(check_channel_wechat_bot(configured=wechat_bot.configured))
+        # 打印启动自检报告 (stderr + app 日志). has_fatal 时 check_and_abort 会 raise,
+        # 让 uvicorn 以非零码退出 —— 这是故意的: 已配置但起不来绝不静默继续.
+        emit_report(startup_report)
+        check_and_abort(startup_report)
+
+        if wechat_bot.configured:
+            await wechat_bot.start(dispatch_fn=_dispatch_channel_message)
+
         try:
             yield
         finally:
+            if wechat_bot.configured:
+                await wechat_bot.stop()
             agent_runtime.stop()
             for module in reversed(module_registry.modules):
                 shutdown_result = module.on_shutdown()
@@ -888,10 +1163,12 @@ def create_app(
         cursor: str | None,
     ) -> tuple[list[dict[str, Any]], str | None, int, int]:
         safe_limit = max(1, min(int(limit), 5000))
-        safe_cursor = 0
         try:
             safe_cursor = max(0, int(str(cursor or "0").strip() or "0"))
-        except Exception:
+        except (TypeError, ValueError):
+            logging.getLogger(__name__).debug(
+                "server: cursor=%r not int, defaulting to 0", cursor,
+            )
             safe_cursor = 0
         total = len(rows)
         page = rows[safe_cursor : safe_cursor + safe_limit]
@@ -1100,6 +1377,39 @@ def create_app(
     async def runtime_checkpoints() -> dict[str, Any]:
         return {"ok": True, "result": agent_runtime.list_checkpoints()}
 
+    # -- per-patrol control plane (ADR-004 §6.1) ---------------------------
+
+    @app.get("/api/runtime/patrols")
+    async def runtime_list_patrols() -> dict[str, Any]:
+        patrols = agent_runtime.list_patrols()
+        return {"ok": True, "result": {"patrols": patrols, "total": len(patrols)}}
+
+    @app.get("/api/runtime/patrols/{name}")
+    async def runtime_patrol_status(name: str) -> dict[str, Any]:
+        snapshot = agent_runtime.get_patrol_stats(name)
+        if snapshot is None:
+            return {"ok": False, "error": f"patrol not found: {name}", "result": None}
+        return {"ok": True, "result": snapshot}
+
+    @app.post("/api/runtime/patrols/{name}/enable")
+    async def runtime_patrol_enable(name: str) -> dict[str, Any]:
+        ok = agent_runtime.enable_patrol(name)
+        if not ok:
+            return {"ok": False, "error": f"patrol not found or not controllable: {name}"}
+        return {"ok": True, "result": {"name": name, "enabled": True}}
+
+    @app.post("/api/runtime/patrols/{name}/disable")
+    async def runtime_patrol_disable(name: str) -> dict[str, Any]:
+        ok = agent_runtime.disable_patrol(name)
+        if not ok:
+            return {"ok": False, "error": f"patrol not found or not controllable: {name}"}
+        return {"ok": True, "result": {"name": name, "enabled": False}}
+
+    @app.post("/api/runtime/patrols/{name}/trigger")
+    async def runtime_patrol_trigger(name: str) -> dict[str, Any]:
+        result = agent_runtime.run_patrol_once(name)
+        return {"ok": bool(result.get("ok")), "result": result}
+
     @app.get("/api/runtime/subagents")
     async def runtime_subagents(parent_task_id: str | None = None) -> dict[str, Any]:
         return {"ok": True, "result": agent_runtime.list_subagents(parent_task_id)}
@@ -1302,21 +1612,25 @@ def create_app(
         top_k_raw = request_payload.get("top_k", 5)
         try:
             top_k = int(top_k_raw)
-        except Exception:
+        except (TypeError, ValueError):
+            logging.getLogger(__name__).debug(
+                "/api/memory/search: top_k=%r not int, using 5", top_k_raw,
+            )
             top_k = 5
-        min_similarity_raw = request_payload.get("min_similarity", 0.2)
-        try:
-            min_similarity = float(min_similarity_raw)
-        except Exception:
-            min_similarity = 0.2
         session_id = str(request_payload.get("session_id") or "").strip() or None
-        rows = recall_memory.search(
-            query=query,
+        keywords_raw = request_payload.get("keywords")
+        if isinstance(keywords_raw, list) and keywords_raw:
+            keywords = [str(k).strip() for k in keywords_raw if str(k or "").strip()]
+        else:
+            keywords = [query]
+        match_mode = str(request_payload.get("match") or "any").strip().lower()
+        rows = recall_memory.search_keyword(
+            keywords=keywords,
             top_k=max(1, min(top_k, 30)),
-            min_similarity=max(0.0, min(min_similarity, 1.0)),
             session_id=session_id,
+            match=match_mode,
         )
-        return {"query": query, "total": len(rows), "items": rows}
+        return {"query": query, "keywords": keywords, "total": len(rows), "items": rows}
 
     @app.get("/api/memory/archival/recent")
     async def memory_archival_recent(limit: int = 20) -> dict[str, Any]:
@@ -1332,7 +1646,10 @@ def create_app(
         limit_raw = request_payload.get("limit", 30)
         try:
             limit = int(limit_raw)
-        except Exception:
+        except (TypeError, ValueError):
+            logging.getLogger(__name__).debug(
+                "/api/memory/archival/query: limit=%r not int, using 30", limit_raw,
+            )
             limit = 30
         rows = archival_memory.query(
             subject=subject,
@@ -2205,6 +2522,66 @@ def create_app(
         if inspect.isawaitable(result):
             result = await result
         return {"ok": True, "ignored": False, "result": result}
+
+    @app.get("/api/channel/wechat-work/events")
+    async def wechat_work_verify(
+        msg_signature: str = "",
+        timestamp: str = "",
+        nonce: str = "",
+        echostr: str = "",
+    ) -> Response:
+        """URL verification callback for WeCom."""
+        adapter: WechatWorkChannelAdapter = channel_adapters["wechat-work"]  # type: ignore[assignment]
+        if not adapter.configured:
+            raise HTTPException(status_code=503, detail="wechat-work channel not configured")
+        decrypted = adapter.verify_url(msg_signature, timestamp, nonce, echostr)
+        if decrypted is None:
+            raise HTTPException(status_code=403, detail="signature verification failed")
+        return Response(content=decrypted, media_type="text/plain")
+
+    @app.post("/api/channel/wechat-work/events")
+    async def wechat_work_events(
+        request: Request,
+        msg_signature: str = "",
+        timestamp: str = "",
+        nonce: str = "",
+    ) -> Response:
+        """Receive encrypted messages from WeCom."""
+        adapter: WechatWorkChannelAdapter = channel_adapters["wechat-work"]  # type: ignore[assignment]
+        if not adapter.configured:
+            raise HTTPException(status_code=503, detail="wechat-work channel not configured")
+
+        body_bytes = await request.body()
+        xml_body = body_bytes.decode("utf-8", errors="ignore")
+
+        message = adapter.parse_incoming({
+            "xml_body": xml_body,
+            "msg_signature": msg_signature,
+            "timestamp": timestamp,
+            "nonce": nonce,
+        })
+        if message is None:
+            return Response(content="success", media_type="text/plain")
+
+        result = adapter.dispatch(message)
+        if inspect.isawaitable(result):
+            result = await result
+
+        reply_text = ""
+        if isinstance(result, dict):
+            brain_result = result.get("result")
+            if isinstance(brain_result, dict):
+                reply_text = str(brain_result.get("answer") or brain_result.get("text") or "")
+            elif isinstance(brain_result, str):
+                reply_text = brain_result
+        if reply_text:
+            adapter.send(OutgoingMessage(
+                channel="wechat-work",
+                target_id=message.user_id,
+                text=reply_text,
+            ))
+
+        return Response(content="success", media_type="text/plain")
 
     module_registry.attach_to_app(app)
     return app

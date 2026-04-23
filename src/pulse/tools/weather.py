@@ -27,7 +27,17 @@ def _weather_code_text(code: int) -> str:
 
 @tool(
     name="weather.current",
-    description="Get current weather from Open-Meteo API",
+    description="Get current weather for a city via Open-Meteo (geocode + forecast).",
+    when_to_use=(
+        "输入一个城市名 (location, 中英文均可), 返回该城市**当前**实况: "
+        "温度 / 湿度 / weather_code / 语义 condition。内部先做 geocoding 再查 current 点, "
+        "无本地状态副作用。"
+    ),
+    when_not_to_use=(
+        "能力边界外: 1) 未来多日 / 逐小时预报 (API 只返回 current 单点); "
+        "2) 历史天气回查; "
+        "3) location 字段为空或无法地理编码时 API 返回 ok=false, 调用方不得据此编造天气。"
+    ),
     ring="ring1_builtin",
     schema={
         "type": "object",

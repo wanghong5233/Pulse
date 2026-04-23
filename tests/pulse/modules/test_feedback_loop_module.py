@@ -11,9 +11,9 @@ pytestmark = pytest.mark.usefixtures("postgres_test_db")
 def test_feedback_loop_submit_triggers_evolution_pipeline() -> None:
     app = create_app()
     with TestClient(app) as client:
-        stats_resp = client.get("/api/modules/feedback_loop/stats")
+        stats_resp = client.get("/api/modules/system/feedback/stats")
         submit_resp = client.post(
-            "/api/modules/feedback_loop/submit",
+            "/api/modules/system/feedback/submit",
             json={
                 "type": "correction",
                 "content": "默认城市 杭州，以后回答简短一点。",

@@ -1,1 +1,0 @@
-"""Intelligence semantic query module."""
