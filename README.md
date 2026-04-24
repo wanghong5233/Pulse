@@ -96,47 +96,49 @@ Pulse 想做的是"**把 Agent 从对话窗口中解耦出来,成为一个长期
 ### 全景图
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                     Pulse (单 Python 进程)                              │
-│                                                                          │
-│  ┌──────────────────────── 接入层 ────────────────────────────┐         │
-│  │  HTTP API │ SSE 事件流 │ CLI │ 飞书 Adapter │ MCP Server   │         │
-│  └──────────────────────────┬───────────────────────────────┘         │
-│                              ↓                                           │
-│  ┌──────────────────── Agent OS 内核 ────────────────────────┐         │
-│  │                                                            │         │
-│  │  AgentRuntime  ──→  调度 / active hours / patrol 生命周期 │         │
-│  │       │                                                    │         │
-│  │       ▼                                                    │         │
-│  │  Task Runtime (Brain)  ──→  ReAct 推理循环                │         │
-│  │       │                      + ToolUseContract (A/B/C)    │         │
-│  │       ▼                                                    │         │
-│  │  Memory Runtime        ──→  Layer × Scope 五层记忆        │         │
-│  │       │                                                    │         │
-│  │       ▼                                                    │         │
-│  │  Observability Plane   ──→  EventBus + JSONL + InMemStore │         │
-│  │       │                                                    │         │
-│  │       ▼                                                    │         │
-│  │  SafetyPlane (规划中)  ──→  订阅事件流做策略门控           │         │
-│  │                                                            │         │
-│  └────────────────────────────────────────────────────────────┘         │
-│                              ↓                                           │
-│  ┌──────────────── 三环能力模型 (Brain 的 tool list) ────────┐         │
-│  │  Ring 1 Tool         轻量级内置函数 (alarm/weather/web…)  │         │
-│  │  Ring 2 Module       业务技能包 (job/intel/email/system)  │         │
-│  │  Ring 3 External MCP 任意外部 MCP Server (GitHub/Notion…) │         │
-│  │  Meta   SkillGen     自然语言 → 新工具热加载              │         │
-│  └────────────────────────────────────────────────────────────┘         │
-│                              ↓                                           │
-│  ┌──────────────── Capability Layer (领域无关) ─────────────┐         │
-│  │  LLM Router · Browser Pool · Storage · Notify · Scheduler│         │
-│  │  Channel · Policy · EventBus · Cost · Config             │         │
-│  └──────────────────────────────────────────────────────────┘         │
-│                                                                          │
-├──────────────────────────────────────────────────────────────────────────┤
-│  PostgreSQL (业务数据 + 记忆)  │  JSON(Core Memory)  │  外部 MCP Servers │
-└──────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Pulse 主 Python 进程   (FastAPI / uvicorn · 单进程 + asyncio + 后台线程)  │
+│                                                                            │
+│  ┌──────────────────────── 接入层 ──────────────────────────┐             │
+│  │  HTTP API │ SSE 事件流 │ CLI │ 飞书 Adapter │ MCP Server │             │
+│  └───────────────────────────┬──────────────────────────────┘             │
+│                              │                                             │
+│                              ▼                                             │
+│  ┌──────────────────── Agent OS 内核 ───────────────────────┐             │
+│  │  AgentRuntime    ──→ 调度 / active hours / patrol 生命周期│             │
+│  │    · 后台守护线程 `pulse-scheduler-runner`(tick≈15s)      │             │
+│  │    · 每个 tick 以 asyncio 执行到期 patrol(chat/greet…)    │             │
+│  │                                                          │             │
+│  │  Task Runtime (Brain) ──→ ReAct 推理循环                 │             │
+│  │                           + ToolUseContract (A/B/C)      │             │
+│  │  Memory Runtime       ──→ Layer × Scope 五层记忆         │             │
+│  │  Observability Plane  ──→ EventBus + JSONL + InMemStore  │             │
+│  │  SafetyPlane (规划中) ──→ 订阅事件流做策略门控            │             │
+│  └───────────────────────────┬──────────────────────────────┘             │
+│                              │                                             │
+│                              ▼                                             │
+│  ┌──────────── 三环能力模型 (Brain 的 tool list) ───────────┐             │
+│  │  Ring 1 Tool         轻量级内置函数 (alarm/weather/web…) │             │
+│  │  Ring 2 Module       业务技能包 (job/intel/email/system) │             │
+│  │  Ring 3 External MCP 任意外部 MCP Server(跨进程调用)     │             │
+│  │  Meta   SkillGen     自然语言 → 新工具热加载             │             │
+│  └──────────────────────────────────────────────────────────┘             │
+│                                                                            │
+│  ┌──────────── Capability Layer (领域无关) ─────────────────┐             │
+│  │  LLM Router · Browser Pool · Storage · Notify · Scheduler│             │
+│  │  Channel · Policy · EventBus · Cost · Config             │             │
+│  └──────────────────────────────────────────────────────────┘             │
+└───────────┬─────────────────────┬──────────────────────┬──────────────────┘
+            │  stdio / subprocess │  CDP (WebSocket)     │  TCP/Unix socket
+            ▼                     ▼                      ▼
+   ┌────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+   │ 外部 MCP Server│  │  Chromium OS 子进程  │  │  PostgreSQL          │
+   │ (各自独立进程) │  │  (Patchright 派生,   │  │  业务数据 · 记忆      │
+   │ GitHub/Notion..│  │   处理 BOSS / 网页)  │  │  审计(JSONL 落盘)    │
+   └────────────────┘  └──────────────────────┘  └──────────────────────┘
 ```
+
+> **并发模型一句话说明**：Pulse 的 Python 代码**全部在一个进程内**,通过 asyncio + 一个守护线程跑所有 patrol 任务(如 BOSS 自动回复 / 自动投递),**不会**为每个 patrol 新起 Python 进程;真正会被派生成独立 OS 子进程的,只有 Patchright 驱动的 **Chromium** 和通过 stdio 接入的 **外部 MCP Server**。这是 Python GIL 下的典型部署形态,也是 Claude Desktop / Cursor 等同类项目的通用做法。
 
 ### 内核五层(`docs/Pulse-内核架构总览.md`)
 

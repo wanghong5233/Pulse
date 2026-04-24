@@ -97,47 +97,50 @@ Pulse aims to **decouple the agent from the chat window and turn it into an assi
 ### Big picture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                     Pulse (single Python process)                        │
-│                                                                          │
-│  ┌──────────────────────── Ingress ────────────────────────────┐         │
-│  │  HTTP API │ SSE stream │ CLI │ Feishu adapter │ MCP Server│         │
-│  └──────────────────────────┬───────────────────────────────┘         │
-│                              ↓                                           │
-│  ┌──────────────────── Agent OS kernel ────────────────────────┐         │
-│  │                                                            │         │
-│  │  AgentRuntime  ──→  scheduling / active hours / patrol LC  │         │
-│  │       │                                                    │         │
-│  │       ▼                                                    │         │
-│  │  Task Runtime (Brain)  ──→  ReAct loop                    │         │
-│  │       │                      + ToolUseContract (A/B/C)    │         │
-│  │       ▼                                                    │         │
-│  │  Memory Runtime        ──→  Layer × Scope five layers      │         │
-│  │       │                                                    │         │
-│  │       ▼                                                    │         │
-│  │  Observability Plane   ──→  EventBus + JSONL + InMemStore │         │
-│  │       │                                                    │         │
-│  │       ▼                                                    │         │
-│  │  SafetyPlane (planned) ──→  subscribe + policy gating      │         │
-│  │                                                            │         │
-│  └────────────────────────────────────────────────────────────┘         │
-│                              ↓                                           │
-│  ┌──────────────── Three-ring capability (Brain tool list) ─┐         │
-│  │  Ring 1 Tool         light built-ins (alarm/weather/web…) │         │
-│  │  Ring 2 Module       domain packs (job/intel/email/sys)   │         │
-│  │  Ring 3 External MCP any MCP server (GitHub/Notion…)      │         │
-│  │  Meta   SkillGen     NL → hot-loaded new tools            │         │
-│  └────────────────────────────────────────────────────────────┘         │
-│                              ↓                                           │
-│  ┌──────────────── Capability layer (domain-agnostic) ─────┐         │
-│  │  LLM Router · Browser Pool · Storage · Notify · Scheduler│         │
-│  │  Channel · Policy · EventBus · Cost · Config             │         │
-│  └──────────────────────────────────────────────────────────┘         │
-│                                                                          │
-├──────────────────────────────────────────────────────────────────────────┤
-│  PostgreSQL (app data + memory) │ JSON (Core Memory) │ External MCP     │
-└──────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│  Pulse main Python process   (FastAPI / uvicorn · single proc + asyncio    │
+│                               + 1 background daemon thread)               │
+│                                                                            │
+│  ┌──────────────────────── Ingress ────────────────────────┐              │
+│  │  HTTP API │ SSE stream │ CLI │ Feishu adapter │ MCP     │              │
+│  └───────────────────────────┬─────────────────────────────┘              │
+│                              │                                             │
+│                              ▼                                             │
+│  ┌──────────────────── Agent OS kernel ───────────────────┐               │
+│  │  AgentRuntime    ──→ scheduling / active hours / patrol │               │
+│  │    · daemon thread `pulse-scheduler-runner` (tick≈15s) │               │
+│  │    · each tick runs due patrols with asyncio           │               │
+│  │                                                         │               │
+│  │  Brain (task executor) ──→ ReAct loop                 │               │
+│  │                            + ToolUseContract (A/B/C)  │               │
+│  │  Memory Runtime       ──→ Layer × Scope five layers    │               │
+│  │  Observability Plane  ──→ EventBus + JSONL + InMemStore│               │
+│  │  SafetyPlane (planned)──→ subscribe + policy gating    │               │
+│  └───────────────────────────┬─────────────────────────────┘              │
+│                              │                                             │
+│                              ▼                                             │
+│  ┌──────────── Three-ring capability (Brain tool list) ────┐              │
+│  │  Ring 1 Tool         light built-ins (alarm/weather/web)│              │
+│  │  Ring 2 Module       domain packs (job/intel/email/sys) │              │
+│  │  Ring 3 External MCP any MCP server (cross-process)     │              │
+│  │  Meta   SkillGen     NL → hot-loaded new tools          │              │
+│  └─────────────────────────────────────────────────────────┘              │
+│                                                                            │
+│  ┌──────────── Capability layer (domain-agnostic) ────────┐               │
+│  │  LLM Router · Browser Pool · Storage · Notify · Sched  │               │
+│  │  Channel · Policy · EventBus · Cost · Config           │               │
+│  └────────────────────────────────────────────────────────┘               │
+└───────────┬─────────────────────┬──────────────────────┬──────────────────┘
+            │  stdio / subprocess │  CDP (WebSocket)     │  TCP / Unix sock
+            ▼                     ▼                      ▼
+   ┌────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+   │ External MCP   │  │  Chromium OS subproc │  │  PostgreSQL          │
+   │ (own processes)│  │  (spawned by         │  │  app data + memory   │
+   │ GitHub/Notion..│  │   Patchright / BOSS) │  │  audit via JSONL     │
+   └────────────────┘  └──────────────────────┘  └──────────────────────┘
 ```
+
+> **Concurrency model in one line**: all Pulse Python code lives in **one process**; every patrol (BOSS auto-reply, auto-apply, ...) is driven by asyncio on a single daemon thread — Pulse **never** spawns a new Python process per patrol. The only real OS subprocesses are **Chromium** (launched by Patchright for web automation) and **external MCP Servers** (attached over stdio). This is the same deployment topology used by Claude Desktop / Cursor and is a standard pattern under Python's GIL.
 
 ### Five kernel layers (`docs/Pulse-内核架构总览.md`)
 
