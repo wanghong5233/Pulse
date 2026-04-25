@@ -185,6 +185,8 @@ class JobGreetModule(BaseModule):
             handler=self._patrol,
             peak_interval=int(self._settings.patrol_greet_interval_peak),
             offpeak_interval=int(self._settings.patrol_greet_interval_offpeak),
+            weekday_windows=((9, 12), (14, 18)),
+            weekend_windows=(),
         )
 
     def _patrol(self, ctx: TaskContext) -> dict[str, Any]:

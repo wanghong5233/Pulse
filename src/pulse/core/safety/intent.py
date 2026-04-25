@@ -1,15 +1,15 @@
-"""SafetyPlane · Intent 原语 (ADR-006 §4.3).
+"""SafetyPlane · Intent 原语.
 
-Intent 描述的是"Agent 正要发起的动作",是 ``PermissionGate.check`` 的
-两个入参之一(另一个是 :class:`PermissionContext`)。它是 **只读语义快照**:
+Intent 描述"即将发生的一次动作", 是 policy 函数的两个入参之一 (另一个
+是 :class:`PermissionContext`). 它是 **只读语义快照**:
 
-* Gate 对 Intent 的观察必须是"拍快照即不变"的,否则规则求值过程中
-  被调用方偷偷改字段会产生"看起来是 A 实际是 B"的幽灵判决。
-* Intent 不含调用方身份(module / task_id / trace_id),那些在
-  ``PermissionContext`` 里。Intent 只回答 **"要做什么"**,
-  PermissionContext 回答 **"谁在什么环境下要做"**。
+* Policy 对 Intent 的观察必须是"拍快照即不变"的, 否则求值过程中
+  被调用方偷偷改字段会产生"看起来是 A 实际是 B"的幽灵判决.
+* Intent 不含调用方身份 (module / task_id / trace_id), 那些在
+  ``PermissionContext`` 里. Intent 只回答 **"要做什么"**,
+  PermissionContext 回答 **"谁在什么环境下要做"**.
 
-设计参见 ADR-006 §4.3。
+规约权威: ``docs/adr/ADR-006-v2-SafetyPlane.md``.
 """
 
 from __future__ import annotations
@@ -26,9 +26,13 @@ __all__ = (
 
 
 IntentKind = Literal[
-    "tool_call",  # Brain ReAct loop 要调一个注册工具
-    "mutation",   # Module 自己发起的 mutating 动作 (例: 发 HR 回复 / 扣款)
-    "reply",      # 面向外部用户的可见回复 (草稿也算)
+    # v2 架构下, 所有 side-effect 都在 Module service 层自己发起 (例: 发
+    # HR 回复 / 发简历 / 点卡片); Brain 不再直接触发外部动作, 因此只保留
+    # ``mutation``. ``tool_call`` / ``reply`` 留做历史枚举值供旧序列化快照
+    # 回放, 活体代码不应产生这两种新 Intent.
+    "tool_call",
+    "mutation",
+    "reply",
 ]
 
 VALID_INTENT_KINDS: frozenset[str] = frozenset(IntentKind.__args__)  # type: ignore[attr-defined]
@@ -41,26 +45,26 @@ class Intent:
     字段语义
     =========
 
-    * ``kind``: 动作类别, 决定规则匹配时的 selector 命名空间
-      (``tool_call:*`` / ``mutation:*`` / ``reply:*``)。
-    * ``name``: 动作的规范名, 与 ToolRegistry / IntentSpec 的 ``name``
-      一一对应 (例: ``job.chat.send_reply``)。规则用 ``glob`` 匹配。
-    * ``args``: 动作参数 (拷贝后冻结为 ``MappingProxyType``)。Predicate
-      可以读, 但不能通过 Intent 反向修改真实参数 —— 那是调用方的职责。
-    * ``evidence_keys``: 这次动作 **宣称依赖的 profile 字段**。规则可以
-      用 ``all_evidence_in_profile`` 一次性校验这些字段都在 profile 里
-      有实锤, 避免 LLM 编造事实。空 tuple 表示此动作不依赖 profile
-      (典型: 读动作 / 无副作用的查询)。
+    * ``kind``: 动作类别, 仅做审计/历史分类用 (v2 下活体 policy 都是
+      ``mutation``, 不再据 kind 分派逻辑).
+    * ``name``: 动作的规范名 (例: ``job.chat.send_reply``), 写入审计事件
+      便于回溯.
+    * ``args``: 动作参数 (拷贝后冻结为 ``MappingProxyType``). Policy 函数
+      可以读, 但不能通过 Intent 反向修改真实参数 —— 那是调用方的职责.
+    * ``evidence_keys``: 这次动作 **宣称依赖的 profile 字段**. Policy 用
+      :func:`pulse.core.safety.policies.profile_covers` 一次性校验这些
+      字段在 profile 里有实锤, 避免 LLM 编造事实. 空 tuple 表示此动作不
+      走 profile 证据豁免分支.
 
     不变式 (``__post_init__`` 强制)
     ================================
 
-    * ``kind`` 必须是 :data:`VALID_INTENT_KINDS` 之一, 否则
-      ``ValueError`` (新增动作类别要显式扩枚举, 禁止 silent 通过)。
-    * ``name`` 去空白后必须非空。
+    * ``kind`` 必须是 :data:`VALID_INTENT_KINDS` 之一 —— 新增类别要显式
+      扩枚举, 禁止 silent 通过.
+    * ``name`` 去空白后必须非空.
     * ``args`` 必须是 mapping; 构造后被冻结 + 拷贝, 外部对原 dict 的
-      修改不影响 Intent。
-    * ``evidence_keys`` 被冻结为 tuple。
+      修改不影响 Intent.
+    * ``evidence_keys`` 被冻结为 tuple.
     """
 
     kind: IntentKind
@@ -100,3 +104,15 @@ class Intent:
             "args": dict(self.args),
             "evidence_keys": list(self.evidence_keys),
         }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "Intent":
+        """从 to_dict 产出恢复 Intent. 与持久化层对称, 避免调用方手搓."""
+        if not isinstance(data, Mapping):
+            raise TypeError(f"Intent.from_dict requires Mapping, got {type(data).__name__}")
+        return cls(
+            kind=data["kind"],
+            name=data["name"],
+            args=data.get("args") or {},
+            evidence_keys=tuple(data.get("evidence_keys") or ()),
+        )

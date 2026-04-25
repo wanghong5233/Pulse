@@ -21,6 +21,12 @@ from fastapi import APIRouter
 from ....core.llm.router import LLMRouter
 from ....core.module import BaseModule, IntentSpec
 from ....core.notify.notifier import ConsoleNotifier, Notifier
+from ....core.safety import (
+    ResumedTaskExecutor,
+    SuspendedTask,
+    SuspendedTaskStore,
+)
+from ....core.safety.resume import ResumedExecution
 from ....core.storage.engine import DatabaseEngine
 from ....core.task_context import TaskContext
 from .._connectors import build_connector
@@ -98,6 +104,45 @@ class JobChatModule(BaseModule):
             replier=replier,
         )
 
+    # ------------------------------------------------------------------ SafetyPlane
+
+    def attach_safety_plane(
+        self,
+        *,
+        suspended_store: SuspendedTaskStore,
+        workspace_id: str,
+        mode: str,
+    ) -> None:
+        """Forward SafetyPlane wiring down to the inner service.
+
+        server.py 在所有 module ``on_startup`` 之前调此方法, 让 service 拿到
+        ``SuspendedTaskStore`` 并在 _execute_* 前置跑 policy gate. 这里直接
+        透传 server 下发的 ``workspace_id`` —— 全局一致, 避免与 inbound
+        resume 查出的 workspace 对不齐.
+        """
+        self._service.attach_safety_plane(
+            suspended_store=suspended_store,
+            workspace_id=workspace_id,
+            mode=mode,
+        )
+
+    def get_resumed_task_executor(self) -> ResumedTaskExecutor | None:
+        """Expose the service's Resume → Re-execute callback.
+
+        server.py 把 module -> executor 表注入
+        ``try_resume_suspended_turn``; 用户答 "y" 后 resume 回路调回这里把
+        原 intent 就地重跑 (见 ``JobChatService.resumed_task_executor``).
+        """
+
+        def _executor(
+            *, task: SuspendedTask, user_answer: str
+        ) -> ResumedExecution:
+            return self._service.resumed_task_executor(
+                task=task, user_answer=user_answer
+            )
+
+        return _executor
+
     # ------------------------------------------------------------------ AgentRuntime
 
     def on_startup(self) -> None:
@@ -111,6 +156,8 @@ class JobChatModule(BaseModule):
             handler=self._patrol,
             peak_interval=int(self._settings.patrol_chat_interval_peak),
             offpeak_interval=int(self._settings.patrol_chat_interval_offpeak),
+            weekday_windows=((9, 18),),
+            weekend_windows=((9, 18),),
         )
 
     def _patrol(self, ctx: TaskContext) -> dict[str, Any]:

@@ -10,7 +10,7 @@
   <a href="#why-pulse">Why</a>&nbsp;·&nbsp;
   <a href="#core-capabilities">Capabilities</a>&nbsp;·&nbsp;
   <a href="#system-architecture">Architecture</a>&nbsp;·&nbsp;
-  <a href="#three-pillars-of-the-agent-kernel">Kernel</a>&nbsp;·&nbsp;
+  <a href="#four-pillars-of-the-agent-kernel">Kernel</a>&nbsp;·&nbsp;
   <a href="#quick-start">Quick start</a>&nbsp;·&nbsp;
   <a href="#feature-list">Features</a>&nbsp;·&nbsp;
   <a href="#roadmap">Roadmap</a>&nbsp;·&nbsp;
@@ -89,6 +89,7 @@ Pulse aims to **decouple the agent from the chat window and turn it into an assi
 | **Browser automation** | Patchright (Playwright fork, CDP anti-fingerprinting), validated on BOSS Zhipin | ✅ |
 | **Multi-channel ingress** | HTTP / SSE / CLI / WeCom / Feishu · intent routing exact → prefix → LLM | ✅ |
 | **HITL governance** | Policy Engine L0–L5 gates · approval / rollback / versioned rules + diff | ✅ |
+| **SafetyPlane v2** | Service-layer side-effect gates · **four-step** Suspend-Ask-Resume-**Reexecute** primitive · idempotent Ask dedup · Beijing-time work window (VPN-safe) | ✅ (end-to-end in `job_chat`) |
 
 ---
 
@@ -115,7 +116,8 @@ Pulse aims to **decouple the agent from the chat window and turn it into an assi
 │  │                            + ToolUseContract (A/B/C)  │               │
 │  │  Memory Runtime       ──→ Layer × Scope five layers    │               │
 │  │  Observability Plane  ──→ EventBus + JSONL + InMemStore│               │
-│  │  SafetyPlane (planned)──→ subscribe + policy gating    │               │
+│  │  SafetyPlane v2       ──→ Service gates + Suspend-Ask- │               │
+│  │                           Resume-Reexecute four-step   │               │
 │  └───────────────────────────┬─────────────────────────────┘              │
 │                              │                                             │
 │                              ▼                                             │
@@ -440,8 +442,7 @@ Pulse/
 - DomainMemory spec: [`docs/Pulse-DomainMemory与Tool模式.md`](./docs/Pulse-DomainMemory与Tool模式.md)
 - Testing engineering: [`docs/engineering/testing-guide.md`](./docs/engineering/testing-guide.md)
 - ADRs: [`docs/adr/`](./docs/adr/)
-- Coding / testing constitution: [`docs/code-review-checklist.md`](./docs/code-review-checklist.md)
-- Internal implementation plan (contributors): [`docs/Pulse实施计划.md`](./docs/Pulse实施计划.md)
+- Engineering constitution (code / tests / comments / system shape): [`docs/code-review-checklist.md`](./docs/code-review-checklist.md); Pulse-specific checklist: [`docs/engineering/pulse-conventions.md`](./docs/engineering/pulse-conventions.md)
 
 ---
 
@@ -523,7 +524,7 @@ Contributors from different backgrounds can find a meaningful place:
 - 🎨 **Prompt / LLM researchers** — SOUL evolution, preference learning Track A, DPO collection Track B, and the three-contract Commitment Verifier are frontier problems in LLM engineering
 - 📚 **Docs / evangelists** — bilingual README, ADR translations, tutorial videos, example projects — any form of contribution is welcome
 
-Before opening a PR, please read [`docs/code-review-checklist.md`](./docs/code-review-checklist.md) — Pulse's **coding and testing principles** (no swallowed exceptions, no silent fallbacks, no fabricated tests). Quality bars are high — suited to contributors who value code quality.
+Before opening a PR, read [`docs/code-review-checklist.md`](./docs/code-review-checklist.md) — the **engineering constitution**: maintainability, tests, comments, and **operable system shape** (config, observability, shutdown). Repository-level items are in [`docs/engineering/pulse-conventions.md`](./docs/engineering/pulse-conventions.md). Quality bars are high — suited to contributors who value code quality.
 
 For architecture changes, open an RFC-style issue first; see the ADR process under [`docs/adr/`](./docs/adr/).
 

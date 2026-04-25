@@ -1,6 +1,6 @@
-"""SafetyPlane 契约原语单测 — ADR-006 §4.1/4.2/4.3.
+"""SafetyPlane 契约原语单测.
 
-这里只覆盖 ``core/safety/{intent,decision,context}.py`` 三个模块的契约:
+覆盖 ``core/safety/{intent,decision,context}.py`` 三个模块的契约:
 
 * 构造约束 (哪些组合必须 raise)
 * 不可变性 (frozen / MappingProxyType / 拷贝隔离)
@@ -8,8 +8,8 @@
 * 便捷构造器 (``Decision.allow`` / ``.deny`` / ``.ask``) 走与直接
   构造同样的不变式闸门, 不能绕过
 
-不覆盖: 规则引擎 / Gate 默认实现 / SuspendedTaskStore —— 那些分别在
-Step A.2 / A.3 / A.4 落地后各自的 test 文件里覆盖, 不在这里膨胀。
+不覆盖: 三条 policy 函数 / SuspendedTaskStore —— 各自在
+``test_policies.py`` / ``test_suspended.py`` 里覆盖, 不在这里膨胀.
 
 测试宪法对齐:
 
@@ -125,15 +125,8 @@ def test_intent_to_dict_roundtrip_preserves_payload() -> None:
         evidence_keys=("profile.game_accounts.原神",),
     )
 
-    payload = intent.to_dict()
-
-    reconstructed = Intent(
-        kind=payload["kind"],
-        name=payload["name"],
-        args=payload["args"],
-        evidence_keys=tuple(payload["evidence_keys"]),
-    )
-    assert reconstructed == intent
+    # from_dict 是 A.4 持久化层对称入口, 这里顺带断言它等价于手搓反构造
+    assert Intent.from_dict(intent.to_dict()) == intent
 
 
 def test_intent_kind_literal_whitelist_stays_in_sync() -> None:
@@ -319,18 +312,16 @@ def _ctx() -> PermissionContext:
         task_id="job_chat:hr_001",
         trace_id="trace_abc",
         user_id="user_x",
-        rules={"core.default": {"decision": "allow"}},
         profile_view={"profile.base_city": "杭州"},
-        session_approvals=frozenset({"job_chat.loose_salary"}),
+        session_approvals=frozenset({"reply:conv_1:hash_x"}),
     )
 
 
 def test_permission_context_valid_construction_and_frozenness() -> None:
     ctx = _ctx()
     assert ctx.module == "job_chat"
-    assert "core.default" in ctx.rules
     assert "profile.base_city" in ctx.profile_view
-    assert "job_chat.loose_salary" in ctx.session_approvals
+    assert "reply:conv_1:hash_x" in ctx.session_approvals
 
     with pytest.raises(Exception):  # frozen
         ctx.module = "mail"  # type: ignore[misc]
@@ -356,11 +347,10 @@ def test_permission_context_user_id_must_be_none_or_non_empty() -> None:
         PermissionContext(module="m", task_id="t", trace_id="tr", user_id="")
 
 
-def test_permission_context_isolates_rules_and_profile_from_external_mutation() -> None:
+def test_permission_context_isolates_profile_from_external_mutation() -> None:
     """外部持有原 dict 后, 修改不应影响已构造的 Context —— 避免评估中
-    途被改而产生幽灵判决。这是 ADR-006 §4.2 不变式的代码锚点。
+    途被改而产生幽灵判决. 这是 PermissionContext 不变式的代码锚点.
     """
-    rules_caller: dict[str, object] = {"rule.a": {"decision": "allow"}}
     profile_caller: dict[str, object] = {"profile.x": "old"}
 
     ctx = PermissionContext(
@@ -368,23 +358,15 @@ def test_permission_context_isolates_rules_and_profile_from_external_mutation() 
         task_id="t",
         trace_id="tr",
         user_id="u",
-        rules=rules_caller,
         profile_view=profile_caller,
     )
 
-    rules_caller["rule.a"] = {"decision": "deny"}
-    rules_caller["rule.b"] = {"decision": "ask"}
     profile_caller["profile.x"] = "mutated"
     profile_caller["profile.y"] = "leaked"
 
-    assert ctx.rules["rule.a"] == {"decision": "allow"}
-    assert "rule.b" not in ctx.rules
     assert ctx.profile_view["profile.x"] == "old"
     assert "profile.y" not in ctx.profile_view
 
-    # 通过 Context 也无法反向写回
-    with pytest.raises(TypeError):
-        ctx.rules["rule.c"] = {"decision": "allow"}  # type: ignore[index]
     with pytest.raises(TypeError):
         ctx.profile_view["profile.z"] = "hack"  # type: ignore[index]
 
@@ -403,13 +385,12 @@ def test_permission_context_session_approvals_type_is_enforced() -> None:
 
 def test_permission_context_with_session_approval_is_functional() -> None:
     ctx = _ctx()
-    extended = ctx.with_session_approval("job_chat.one_shot_time_allow")
+    extended = ctx.with_session_approval("reply:conv_2:hash_new")
 
     assert extended is not ctx
-    assert "job_chat.one_shot_time_allow" in extended.session_approvals
-    assert "job_chat.loose_salary" in extended.session_approvals
-    # 原 Context 不被污染
-    assert "job_chat.one_shot_time_allow" not in ctx.session_approvals
+    assert "reply:conv_2:hash_new" in extended.session_approvals
+    assert "reply:conv_1:hash_x" in extended.session_approvals
+    assert "reply:conv_2:hash_new" not in ctx.session_approvals
 
     with pytest.raises(ValueError):
         ctx.with_session_approval("")

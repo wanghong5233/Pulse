@@ -10,7 +10,17 @@ Pure policy component. Given:
 
 Returns :class:`ReplyDraft` with ``reply_text``, ``tone``, ``confidence`` and
 ``needs_hitl``. ``confidence`` is a 0.0-1.0 score the service uses to decide
-whether to auto-send; ``needs_hitl=True`` forces escalate regardless.
+whether to auto-send.
+
+.. note::
+
+   ``ReplyDraft.needs_hitl`` 是 **LLM 自陈信号**, 保留是为了不破坏调用方的
+   to_dict 契约 / 回归 fixture, 但它 **不参与任何 HITL 决策**. 授权决策的
+   唯一出口是 SafetyPlane (ADR-006-v2): Service 层 ``_execute_*`` 前置跑
+   :mod:`pulse.core.safety.policies` 的 Python policy 函数做
+   Allow/Deny/Ask 判决. LLM 只出事实 / 举证标签, 不出授权结论
+   ("LLM as Advisor, Not Judge", 见
+   ``docs/engineering/safety-rules-vs-intelligence.md``).
 
 Upstream :class:`HrMessagePlanner` already picked an ``action`` (e.g. ``reply``
 vs ``send_resume``); replier only runs when action == ``reply`` AND the
@@ -40,6 +50,12 @@ _HISTORY_MAX_TURNS = 6
 
 @dataclass(frozen=True, slots=True)
 class ReplyDraft:
+    """LLM draft output. ``needs_hitl`` is **deprecated advisory**: kept for
+    ``to_dict()`` backward compatibility with earlier fixtures/consumers, but
+    SafetyPlane is the single authorization gate — downstream callers MUST
+    NOT branch on ``needs_hitl``. See module docstring.
+    """
+
     reply_text: str
     tone: str = "professional"
     confidence: float = 0.0
@@ -106,19 +122,20 @@ class HrReplyGenerator:
         tone = (tone_hint or "").strip().lower()
         tone_md = tone if tone in _TONES else "professional"
 
+        # Why this prompt is policy-free: LLM 被教成"不承诺时间 / 不示好屏蔽
+        # 公司"会被新样本绕过且无审计痕迹. SafetyPlane 在 tool-use 前用
+        # config/safety/job_chat.yaml 兜底, LLM 只负责生成草稿.
         system_prompt = (
             "You draft the USER's reply to an HR on a Chinese recruiting platform. "
-            "Respect the user's preferences and facts: 不要对已屏蔽公司示好; "
-            "不要承诺简历/面试/到岗时间除非 user_facts 明确支持; 不要编造技能。\n"
+            "Only produce a candidate draft from conversation context and the user "
+            "preferences block below; DO NOT try to enforce safety / authorization "
+            "rules yourself — that decision is made downstream.\n"
             f"约束: reply_text ≤ {max_chars} 汉字, 语气 {tone_md}, 一段话不换行.\n"
-            "如果问题触及敏感话题(薪资具体数字 / offer 比较 / 线下面试时间) 或"
-            "需要用户主观决策, 设 needs_hitl=true 并把草稿写成温和的 stall 句式(例如"
-            "'这个我稍后详细回复你')。\n"
             "Respond with ONLY a JSON object. Schema:\n"
             '{"reply_text":"<中文>",'
             '"tone":"professional|friendly|concise",'
             '"confidence":<float 0-1>,'
-            '"needs_hitl":<bool>,'
+            '"needs_hitl":<bool — deprecated, advisory only>,'
             '"reason":"<one line>"}\n\n'
             f"## User preferences\n{snapshot_md}"
         )

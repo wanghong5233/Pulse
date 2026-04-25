@@ -80,10 +80,24 @@ class JobSettings(BaseSettings):
 
     # patrol scheduling — 只保留调度节拍; 启停语义见 ADR-004 §6.1.1
     # (IM 独占控制, 不读 env)
+    #
+    # chat 自动回复: 每天 09-18 按 5 分钟 / 次巡检. HR 回复是对话响应,
+    # 不需要卡"高峰投递窗口", 但夜间 / 周末静默降低风控和打扰.
+    #
+    # greet 自动投递 / 打招呼: 只在工作日高峰窗口跑, 其它时间静默. 这里的
+    # peak/offpeak interval 仅表达窗口内节拍; 是否能跑由 module 注册时的
+    # weekday_windows 控制.
+    #
+    # chat 节拍定为 5 分钟 / 次的理由:
+    # * BOSS 平台 HR 人工响应的典型节奏是分钟到十分钟级, 秒级扫描带来的"快"
+    #   用户根本感知不到, 反而叠加风控(异常高频访问);
+    # * 5 分钟是用户手动点刷新按钮时不会感到明显延迟的阈值, 同时让一次
+    #   patrol 的 planner + policy 审计片段间隔足够清晰, 不会被 audit 流
+    #   糊成墙状;
     patrol_greet_interval_peak: int = Field(default=900, ge=30, le=86400)
     patrol_greet_interval_offpeak: int = Field(default=1800, ge=30, le=86400)
-    patrol_chat_interval_peak: int = Field(default=180, ge=30, le=86400)
-    patrol_chat_interval_offpeak: int = Field(default=600, ge=30, le=86400)
+    patrol_chat_interval_peak: int = Field(default=300, ge=30, le=86400)
+    patrol_chat_interval_offpeak: int = Field(default=300, ge=30, le=86400)
 
     model_config = SettingsConfigDict(
         env_prefix="PULSE_JOB_",

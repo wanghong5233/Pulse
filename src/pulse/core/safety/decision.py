@@ -1,17 +1,18 @@
-"""SafetyPlane · Decision / AskRequest / ResumeHandle (ADR-006 §4.1).
+"""SafetyPlane · Decision / AskRequest / ResumeHandle 契约原语.
 
-Gate 的输出三元组。核心语义:
+Policy 函数的输出三元组. 核心语义:
 
 * :class:`Decision` 是 ``allow`` / ``deny`` / ``ask`` 三值决策的容器,
-  Brain 和 Module 都只消费它, 不得自己重新判断 "是否该 ask"。
+  Service 层 (``chat/service.py`` 等) 只消费它, 不得自己重新判断
+  "是否该 ask".
 * :class:`AskRequest` 是 ``kind == "ask"`` 时的附加 payload —— 包含
   给用户的问题、可选草稿、恢复任务所需的回路信息 (:class:`ResumeHandle`)
-  和超时时长。
+  和超时时长.
 * :class:`ResumeHandle` 不是 "handle 指针", 是 Resume 时路由回
   SuspendedTaskStore 所需的 **静态元数据** (task_id / module / intent
-  名 / payload schema)。
+  名 / payload schema).
 
-设计参见 ADR-006 §4.1 / §4.4 / §4.5。
+规约权威: ``docs/adr/ADR-006-v2-SafetyPlane.md``.
 """
 
 from __future__ import annotations
@@ -42,17 +43,17 @@ _LEGACY_ASK_TIMEOUT_SECONDS = 3600
 class ResumeHandle:
     """Resume 路由元数据.
 
-    Gate 在发出 ``ask`` 判决时, 必须同时给出 ``ResumeHandle`` —— 告诉
+    Policy 在发出 ``ask`` 判决时, 必须同时给出 ``ResumeHandle`` —— 告诉
     SuspendedTaskStore 和 Resume 通道:
 
-    * ``task_id``: 本次挂起任务的 id, 也是用户回复里带回的路由键。
+    * ``task_id``: 本次挂起任务的 id, 也是用户回复里带回的路由键.
     * ``module``: 原始调用方的模块名 (``job_chat`` / ``mail`` / ...),
-      Resume 时需要把用户回答派发回同一个 module 消费。
-    * ``intent``: Resume 时要触发的 IntentSpec 名 (MVP 固定
-      ``system.task.resume``; 预留字段是为了未来域特化的 Resume 动作)。
+      Resume 时需要把用户回答派发回同一个 module 消费.
+    * ``intent``: Resume 时要触发的 intent 路由名 (MVP 固定
+      ``system.task.resume``; 预留字段是为了未来域特化的 Resume 动作).
     * ``payload_schema``: 用户回答 payload 的 schema id, Resume 时用来
       校验 "用户答的东西结构是对的", 避免 "用户随便打一句话就被认成
-      resume 参数" 的幽灵漏洞。
+      resume 参数" 的幽灵漏洞.
     """
 
     task_id: str
@@ -91,15 +92,15 @@ class AskRequest:
     """面向人类用户的一次 Ask (Suspend-Ask-Resume 的 Ask 环节).
 
     * ``question``: 用自然语言呈现给用户的主问题 (典型: 转述 HR 的话
-      或说明工具缺什么信息), 必须非空。
-    * ``draft``: Agent 对"如果你同意 / 答 X"的建议草稿。允许为 None
-      (例: 时间类问题没有默认答案), 但给了就必须是可直接发送的成品。
+      或说明工具缺什么信息), 必须非空.
+    * ``draft``: Agent 对"如果你同意 / 答 X"的建议草稿. 允许为 None
+      (例: 时间类问题没有默认答案), 但给了就必须是可直接发送的成品.
     * ``context``: 帮助用户判断的背景字典 (HR 名 / 岗位 / 历史对话
-      摘要等)。拷贝后由 Gate 保管; 允许为空 dict。
-    * ``resume_handle``: 恢复任务的路由元数据, 见 :class:`ResumeHandle`。
-    * ``timeout_seconds``: 用户不回答的等待上限。超时后 SafetyPlane
+      摘要等). 拷贝后由 SuspendedTask 保管; 允许为空 dict.
+    * ``resume_handle``: 恢复任务的路由元数据, 见 :class:`ResumeHandle`.
+    * ``timeout_seconds``: 用户不回答的等待上限. 超时后 SuspendedTaskStore
       把挂起任务标 ``timed_out`` 并落审计事件, 等价于 deny 处理 ——
-      绝不沉默走掉。必须是正整数。
+      绝不沉默走掉. 必须是正整数.
     """
 
     question: str
@@ -160,7 +161,7 @@ class AskRequest:
 
 @dataclass(frozen=True, slots=True)
 class Decision:
-    """Gate 的三值决策 (``allow`` / ``deny`` / ``ask``).
+    """Policy 的三值决策 (``allow`` / ``deny`` / ``ask``).
 
     三种 kind 的字段约束 (``__post_init__`` 强制):
 
@@ -174,15 +175,14 @@ class Decision:
 
     字段叫 ``ask_request`` 而不是 ``ask`` —— 因为便捷构造器
     :meth:`Decision.ask` 是同名的, 在 dataclass 上两者冲突
-    (classmethod 会覆盖 field 默认值)。名词 ``ask_request`` 也比
-    裸名词 ``ask`` 语义更明确。
+    (classmethod 会覆盖 field 默认值). 名词 ``ask_request`` 也比
+    裸名词 ``ask`` 语义更明确.
 
-    ``rule_id`` 允许为 None —— 命中 rule_engine 兜底 ``otherwise`` 或走
-    fail-to-ask 异常路径时, 没有具体 rule 命中。其它情况应该填命中规则
-    的 id, 审计会用它回溯。
+    ``rule_id`` 允许为 None —— policy 走 fail-to-ask 异常路径时可能无具体
+    rule 命中. 其它情况应该填命中 policy 分支的 id, 审计会用它回溯.
 
-    ``reason`` 始终非空, 做为人类可读解释 (例: ``"core.evidence_missing:
-    salary_min"`` / ``"job_chat.interview_time_requires_user"``)。
+    ``reason`` 始终非空, 做为人类可读解释 (例: ``"session_approved"`` /
+    ``"job_chat.reply.requires_user_confirmation"``).
     """
 
     kind: DecisionKind

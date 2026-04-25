@@ -89,3 +89,61 @@ def test_get_task_returns_registered_instance() -> None:
 
     assert engine.get_task("job") is task
     assert engine.get_task("missing") is None
+
+
+def test_task_specific_active_windows_gate_dispatch() -> None:
+    runs: list[str] = []
+    engine = SchedulerEngine()
+    engine.register(
+        ScheduleTask(
+            name="job_greet.patrol",
+            interval_seconds=60,
+            run_immediately=True,
+            handler=lambda: runs.append("greet"),
+            active_hours_only=True,
+            weekday_windows=((9, 12), (14, 18)),
+            weekend_windows=(),
+        )
+    )
+
+    # UTC 04:30 周五 = 北京 12:30 周五, 自动投递午间静默.
+    noon_quiet = datetime(2026, 3, 27, 4, 30, tzinfo=timezone.utc)
+    assert asyncio.run(engine.run_pending(now=noon_quiet)) == []
+    assert runs == []
+
+    # UTC 06:00 周五 = 北京 14:00 周五, 下午高峰窗口内.
+    afternoon_peak = datetime(2026, 3, 27, 6, 0, tzinfo=timezone.utc)
+    assert asyncio.run(engine.run_pending(now=afternoon_peak)) == ["job_greet.patrol"]
+    assert runs == ["greet"]
+
+
+def test_chat_and_greet_can_have_different_weekend_windows() -> None:
+    runs: list[str] = []
+    engine = SchedulerEngine()
+    engine.register(
+        ScheduleTask(
+            name="job_chat.patrol",
+            interval_seconds=60,
+            run_immediately=True,
+            handler=lambda: runs.append("chat"),
+            active_hours_only=True,
+            weekday_windows=((9, 18),),
+            weekend_windows=((9, 18),),
+        )
+    )
+    engine.register(
+        ScheduleTask(
+            name="job_greet.patrol",
+            interval_seconds=60,
+            run_immediately=True,
+            handler=lambda: runs.append("greet"),
+            active_hours_only=True,
+            weekday_windows=((9, 12), (14, 18)),
+            weekend_windows=(),
+        )
+    )
+
+    # UTC 周六 02:00 = 北京周六 10:00: 自动回复跑, 自动投递静默.
+    saturday_morning = datetime(2026, 3, 28, 2, 0, tzinfo=timezone.utc)
+    assert asyncio.run(engine.run_pending(now=saturday_morning)) == ["job_chat.patrol"]
+    assert runs == ["chat"]

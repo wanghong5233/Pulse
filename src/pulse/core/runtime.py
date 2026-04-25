@@ -113,14 +113,23 @@ class RuntimeConfig:
 
     def __init__(self) -> None:
         self.enabled = _env_bool("AGENT_RUNTIME_ENABLED", False)
+        # ``timezone`` 字段保留供审计 / status 展示, 真正的时区换算在
+        # ``pulse.core.scheduler.windows`` 里硬编码 Asia/Shanghai, 与 env
+        # 无关 —— 单用户北京求职场景不需要多 tz 能力, 且 env 覆盖会绕过
+        # "VPN 不影响工作时间判定" 的硬承诺.
         self.timezone = os.environ.get("GUARD_TIMEZONE", "Asia/Shanghai")
         self.tick_seconds = _env_int("AGENT_RUNTIME_TICK_SECONDS", 15)
         self.max_consecutive_errors = _env_int("AGENT_RUNTIME_MAX_ERRORS", 5)
 
+        # 工作时间 = 北京时间工作日 09:00-18:00, 周末整天静默.
+        # 典型 HR 的工作节奏 (投简历反馈 / 约面试) 几乎全落在工作日白天, 夜
+        # 里/周末跑 patrol 不会带来新消息, 只会在 BOSS 侧异常活跃, 反而风控.
+        # 把"周末 10-20"这种旧默认彻底关掉, 让周末真静默 —— 把 start/end 设
+        # 成同一个值, ``is_active_hour`` 返回 False.
         self.active_start_hour = _env_int("GUARD_ACTIVE_START_HOUR", 9)
-        self.active_end_hour = _env_int("GUARD_ACTIVE_END_HOUR", 22)
-        self.weekend_start_hour = _env_int("GUARD_WEEKEND_START_HOUR", 10)
-        self.weekend_end_hour = _env_int("GUARD_WEEKEND_END_HOUR", 20)
+        self.active_end_hour = _env_int("GUARD_ACTIVE_END_HOUR", 18)
+        self.weekend_start_hour = _env_int("GUARD_WEEKEND_START_HOUR", 0)
+        self.weekend_end_hour = _env_int("GUARD_WEEKEND_END_HOUR", 0)
 
     def is_active(self, now: datetime) -> bool:
         return is_active_hour(
@@ -235,6 +244,8 @@ class AgentRuntime:
         offpeak_interval: int,
         enabled: bool = False,
         active_hours_only: bool = True,
+        weekday_windows: tuple[tuple[int, int], ...] | None = None,
+        weekend_windows: tuple[tuple[int, int], ...] | None = None,
         workspace_id: str | None = None,
         token_budget: int = 4000,
     ) -> None:
@@ -275,6 +286,8 @@ class AgentRuntime:
             active_hours_only=active_hours_only,
             active_start=self._config.active_start_hour,
             active_end=self._config.active_end_hour,
+            weekday_windows=tuple(weekday_windows or ()),
+            weekend_windows=tuple(weekend_windows or ()),
         )
         self._runner.register(task)
         self._consecutive_errors[name] = 0

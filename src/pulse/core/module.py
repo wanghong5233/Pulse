@@ -212,6 +212,47 @@ class BaseModule(ABC):
     def bind_event_emitter(self, emitter: EventEmitter | None) -> None:
         self._event_emitter = emitter
 
+    def attach_safety_plane(
+        self,
+        *,
+        suspended_store: Any,
+        workspace_id: str,
+        mode: str,
+    ) -> None:
+        """延迟注入 SafetyPlane 依赖.
+
+        ModuleRegistry.discover() 在 ``workspace_memory`` / ``event_bus`` 就绪
+        **之前**就发生, 所以 module service 无法在 ``__init__`` 里直接拿到
+        ``SuspendedTaskStore``. server.py 先走完 bootstrap, 再回头给每个需要
+        授权闸门的 module 调一次 ``attach_safety_plane`` 补齐依赖.
+
+        默认实现 no-op —— 大部分 module 不产生 side-effect, 也就不需要 policy
+        gate. 需要做 policy 检查的 module 重写此方法, 把依赖存到各自 service.
+
+        参数故意宽泛 (``Any`` + ``str``), 避免 BaseModule 对 safety 子模块产生
+        强依赖 —— core 层不应该 import 具体 module 的东西, safety 也不该 import
+        回 core.module. 具体 module 重写时自己断言类型.
+        """
+        _ = suspended_store, workspace_id, mode
+        return None
+
+    def get_resumed_task_executor(self) -> Callable[..., Any] | None:
+        """可选: 返回一个实现 :class:`ResumedTaskExecutor` Protocol 的 callable.
+
+        server.py 在入站 Resume 回路 (``try_resume_suspended_turn``) 中查一张
+        ``module_name -> executor`` 表: 任务从挂起到归档后, 立刻把原 intent 就
+        地重跑, 不再等下一轮 patrol. 具体契约见
+        ``pulse.core.safety.resume.ResumedTaskExecutor``.
+
+        默认返回 None —— 没有对外副作用的 module (如只读模块) 不必实现.
+        需要 "Resume 后立刻把动作落下" 的 module 必须实现, 否则用户确认
+        后只会得到确认回执, 原始外部动作不会立即发生.
+
+        本方法与 ``attach_safety_plane`` 一样参数宽泛, 避免 core.module 对
+        safety 子模块产生反向依赖. 具体 module 重写时用更紧的类型.
+        """
+        return None
+
     def emit_event(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
         if self._event_emitter is None:
             return

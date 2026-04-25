@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
-from .windows import is_active_hour, is_peak_hour
+from .windows import is_active_hour, is_in_windows, is_peak_hour
 
 TaskHandler = Callable[[], Awaitable[None] | None]
 
@@ -22,6 +22,8 @@ class ScheduleTask:
     active_hours_only: bool = False
     active_start: int = 8
     active_end: int = 23
+    weekday_windows: tuple[tuple[int, int], ...] = ()
+    weekend_windows: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if self.interval_seconds <= 0:
@@ -85,13 +87,21 @@ class SchedulerEngine:
         if not task.enabled:
             return False
         if task.active_hours_only:
-            if not is_active_hour(
-                now,
-                weekday_start=task.active_start,
-                weekday_end=task.active_end,
-                weekend_start=task.active_start + 1,
-                weekend_end=task.active_end,
-            ):
+            if task.weekday_windows or task.weekend_windows:
+                active = is_in_windows(
+                    now,
+                    weekday_windows=task.weekday_windows,
+                    weekend_windows=task.weekend_windows,
+                )
+            else:
+                active = is_active_hour(
+                    now,
+                    weekday_start=task.active_start,
+                    weekday_end=task.active_end,
+                    weekend_start=task.active_start + 1,
+                    weekend_end=task.active_end,
+                )
+            if not active:
                 return False
         last = self._last_run_at.get(task.name)
         if last is None:

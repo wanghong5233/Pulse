@@ -138,6 +138,8 @@ ActionStatus = Literal[
     "failed",     # 所有子动作失败, 或整体失败
     "preview",    # 仅生成了预览, 没有实际执行 (例: confirm_execute=false)
     "skipped",    # 被幂等检查 / 前置条件短路掉了, 未执行
+    "denied",     # 被 SafetyPlane 授权层拒绝, 未触及副作用
+    "suspended",  # 被 SafetyPlane 挂起等待用户裁决
 ]
 
 _VALID_ACTION_STATUSES: frozenset[str] = frozenset(ActionStatus.__args__)  # type: ignore[attr-defined]

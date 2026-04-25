@@ -9,7 +9,7 @@
   <a href="#为什么是-pulse">Why</a>&nbsp;·&nbsp;
   <a href="#核心能力">核心能力</a>&nbsp;·&nbsp;
   <a href="#系统架构">架构</a>&nbsp;·&nbsp;
-  <a href="#agent-内核三项核心设计">内核</a>&nbsp;·&nbsp;
+  <a href="#agent-内核四项核心设计">内核</a>&nbsp;·&nbsp;
   <a href="#快速开始">快速开始</a>&nbsp;·&nbsp;
   <a href="#功能清单">功能</a>&nbsp;·&nbsp;
   <a href="#roadmap">Roadmap</a>&nbsp;·&nbsp;
@@ -88,6 +88,7 @@ Pulse 想做的是"**把 Agent 从对话窗口中解耦出来,成为一个长期
 | **浏览器自动化** | Patchright(Playwright 分支,CDP 层反检测),BOSS 直聘实测通过 | ✅ |
 | **多渠道接入** | HTTP / SSE / CLI / 企业微信 / 飞书 · 消息意图路由 exact → prefix → LLM | ✅ |
 | **HITL 治理** | Policy Engine L0-L5 门控 · approval / rollback / 版本化规则 + 差异对比 | ✅ |
+| **SafetyPlane** | Service 层 side-effect 闸门 · Suspend-Ask-Resume-Reexecute 四步 HITL 原语 · Ask 幂等去重 | ✅ |
 
 ---
 
@@ -113,7 +114,8 @@ Pulse 想做的是"**把 Agent 从对话窗口中解耦出来,成为一个长期
 │  │                           + ToolUseContract (A/B/C)      │             │
 │  │  Memory Runtime       ──→ Layer × Scope 五层记忆         │             │
 │  │  Observability Plane  ──→ EventBus + JSONL + InMemStore  │             │
-│  │  SafetyPlane (规划中) ──→ 订阅事件流做策略门控            │             │
+│  │  SafetyPlane          ──→ Service 闸门 + Suspend-Ask-    │             │
+│  │                           Resume-Reexecute 四步 HITL 原语 │             │
 │  └───────────────────────────┬──────────────────────────────┘             │
 │                              │                                             │
 │                              ▼                                             │
@@ -148,13 +150,13 @@ Pulse 想做的是"**把 Agent 从对话窗口中解耦出来,成为一个长期
 | **Task Runtime** | 单轮执行状态机、tool loop、hook、budget、stop reason、三契约 | cron 调度、长期事实 schema | ✅ |
 | **Memory Runtime** | 五层记忆读写、压缩、晋升、evidence tracing | 任务调度、最终答案生成、审计落盘 | ✅ |
 | **Observability Plane** | 事件总线 + append-only 审计落盘 + 订阅推送 | 业务数据存储、业务决策 | ✅ |
-| **SafetyPlane** | policy gate、approval、rollback、manual takeover | 主动执行业务 | ⏳ 规划中 |
+| **SafetyPlane** | Service 层 side-effect 闸门(policy)、Suspend-Ask-Resume-Reexecute 四步 HITL 原语、Ask 幂等去重 | 业务决策、Intent 构造 | ✅ |
 
 ---
 
-## Agent 内核三项核心设计
+## Agent 内核四项核心设计
 
-这是 Pulse 区别于"又一个 LangChain Agent wrapper"的关键所在。三项设计均有独立 ADR / 设计文档背书,并非概念性承诺。
+这是 Pulse 区别于"又一个 LangChain Agent wrapper"的关键所在。四项设计均有独立 ADR / 设计文档背书,并非概念性承诺。
 
 ### 1. ToolUseContract —— 反 Agent 幻觉的三条正交契约
 
@@ -201,6 +203,23 @@ Pulse 想做的是"**把 Agent 从对话窗口中解耦出来,成为一个长期
 - **对话式控制面**([ADR-004](./docs/adr/ADR-004-AutoReplyContract.md) §6.1):通过 IM 发送"查询后台任务"、"停止 BOSS 自动回复"等指令即可控制,无需开启管理面板。`system.patrol.*` IntentSpec 暴露 `list / status / enable / disable / trigger` 五个动作。
 - **熔断 + 恢复梯度**:`retry` / `degrade` / `skip` / `abort` / `rollback` / `circuitBreak` / `manualTakeover` 七级恢复策略
 - **Observability Plane 独立**:任意层次的事件写入均通过 `EventBus.publish`,两个默认订阅者:`InMemoryEventStore`(滑窗 2000 条,供 WS/SSE 消费)+ `JsonlEventSink`(按天滚动,仅持久化 `llm./tool./memory./policy./promotion.` 前缀)
+
+### 4. SafetyPlane —— Service 层授权闸门 + 四步 HITL 原语
+
+**问题**:长驻 Agent 接入真实外部账号(求职 / 邮箱 / 银行)后,它发出去的每条消息、点击的每个按钮都会打到陌生人。常见的三步 Ask primitive(Suspend / Ask / Resume)在产品里会走到"假成功":Ask 挂起时已把消息从平台未读队列里踢出,下一轮 patrol 不会再拾起;Agent 侧视作"已发送",connector 侧实际从未调用。Brain 层做闸门又会漏掉 patrol 触发的 side-effect。
+
+**Pulse 的答案**([ADR-006](./docs/adr/ADR-006-v2-SafetyPlane.md)):HITL 按四步原语落地,授权判决下沉到 Service 层 side-effect 入口。
+
+| 原语 | 落点 | 不变式 |
+|---|---|---|
+| **Suspend** | `WorkspaceSuspendedTaskStore.create` | 以 `(workspace_id, module, trace_id, intent_name)` 为幂等键;二次 patrol 命中既有 `awaiting_user` 任务时跳过 `mark_processed` 与 `Notifier.send`,不重复骚扰用户 |
+| **Ask** | `Notifier.send`(企业微信 / 飞书 webhook) | patrol 路径没有 IncomingMessage 上下文,Ask 通道独立于 channel adapter;幂等命中时不重发 |
+| **Resume** | `server._dispatch_channel_message` 前置的 `try_resume_suspended_turn` | 用户答复分类为 `approve` / `decline` / `unknown`,`unknown` 保守视作拒绝 |
+| **Reexecute** | 业务模块实现的 `ResumedTaskExecutor` 回调 | Resume 成功后立即把原 Intent 重跑到 connector,用 `run_id="resume-*"` 留审计;用户确认即显式授权,不再经 Brain / policy |
+
+**闸门位置**:授权判决在 `JobChatService._execute_reply` / `_execute_send_resume` / `_execute_card` 三处 side-effect 入口,由 `safety.policies` 下的三条 Python 纯函数承载。Pulse 的触发面除 interactive 还有 patrol,Brain 层闸门必然漏 patrol,因此闸门下沉到 Service 层。
+
+**不变式**:Brain 不参与授权判决;policy 纯函数不做 I/O、不调 LLM;`SuspendedTask.original_intent.args` 自包含,重跑不依赖 service 瞬时状态。
 
 ---
 
@@ -359,6 +378,7 @@ Pulse/
 │   │   ├── events.py            EventBus + InMemoryEventStore
 │   │   ├── event_sinks.py       JsonlEventSink (按天滚动审计)
 │   │   ├── policy.py            Policy Engine (L0-L5 门控)
+│   │   ├── safety/              SafetyPlane (policies / suspended / resume / Reexecute)
 │   │   ├── cost.py              日 LLM 预算 + 自动降级
 │   │   ├── router.py            意图路由 (exact/prefix/LLM)
 │   │   ├── channel/             多渠道 (HTTP/CLI/企业微信/飞书)
@@ -382,7 +402,7 @@ Pulse/
 │   ├── Pulse-AgentRuntime设计.md
 │   ├── Pulse-MemoryRuntime设计.md
 │   ├── Pulse-DomainMemory与Tool模式.md
-│   ├── adr/                     ADR-001 ~ 005
+│   ├── adr/                     ADR-001 ~ 006
 │   ├── engineering/             工程化实践 (测试指南等)
 │   ├── modules/                 模块级设计文档
 │   └── dom-specs/               外部页面真实 DOM 快照 (selector fixture)
@@ -436,10 +456,10 @@ Pulse/
 - AgentRuntime 设计: [`docs/Pulse-AgentRuntime设计.md`](./docs/Pulse-AgentRuntime设计.md)
 - Memory 主设计: [`docs/Pulse-MemoryRuntime设计.md`](./docs/Pulse-MemoryRuntime设计.md)
 - 业务 DomainMemory 规范: [`docs/Pulse-DomainMemory与Tool模式.md`](./docs/Pulse-DomainMemory与Tool模式.md)
+- SafetyPlane(HITL / 授权边界): [`docs/adr/ADR-006-v2-SafetyPlane.md`](./docs/adr/ADR-006-v2-SafetyPlane.md)
 - 测试工程化: [`docs/engineering/testing-guide.md`](./docs/engineering/testing-guide.md)
 - ADR 目录: [`docs/adr/`](./docs/adr/)
-- 编码 / 测试宪法: [`docs/code-review-checklist.md`](./docs/code-review-checklist.md)
-- 内部实施计划(贡献者向): [`docs/Pulse实施计划.md`](./docs/Pulse实施计划.md)
+- 工程宪法(代码 / 测试 / 注释 / 系统形态): [`docs/code-review-checklist.md`](./docs/code-review-checklist.md)；Pulse 落地约定见 [`docs/engineering/pulse-conventions.md`](./docs/engineering/pulse-conventions.md)
 
 ---
 
@@ -456,10 +476,11 @@ Pulse/
 - [x] SOUL 人格分级 + Evolution Engine + Gated/Supervised/Autonomous 治理
 - [x] MCP Server + Client 双向互通
 - [x] 求职技能包:BOSS 扫 JD / 主动打招呼 / HR 对话自动回复 / 发简历 / 邮件追踪
+- [x] **SafetyPlane** —— Service 层 side-effect 闸门 + Suspend-Ask-Resume-Reexecute 四步 HITL 原语 + Ask 幂等去重(ADR-006)
 
 ### 进行中 · 内核加固
 
-- [ ] **SafetyPlane 实装** —— 订阅 EventBus 做 policy gate + manual takeover + 风控沙盘
+- [ ] **SafetyPlane 推广到第二个模块** —— 邮件 / 简历发送等同样产生外部可感知副作用的路径,把 `job_chat` 验证过的四步原语抽成共享 helper
 - [ ] **多渠道接入** —— Discord · Telegram · 企业微信 WebSocket 长连 bot(HTTPS webhook 版本的企业微信 / 飞书已落地)
 - [ ] **求职域情报二期** —— 面经真实站点(牛客/脉脉)、公司深度调研 Module
 - [ ] **本地模型离线模式** —— Ollama + Qwen 本地版,断网也能跑
@@ -521,7 +542,7 @@ Pulse 正处于 v0 阶段,早期贡献者有机会参与到项目核心架构的
 - 🎨 **Prompt / LLM 研究者** —— SOUL 进化、偏好学习 Track A、DPO 采集 Track B、三契约 Commitment Verifier 是 LLM 工程化的前沿问题
 - 📚 **文档 / 布道者** —— 中英双语 README、ADR 翻译、教程视频、示例项目,任意形式的贡献都欢迎
 
-提交 PR 前请阅读 [`docs/code-review-checklist.md`](./docs/code-review-checklist.md) —— 其中包含 Pulse 的**编码规范与测试原则**(禁止吞异常、禁止静默兜底、禁止虚假测试),标准较高,适合重视代码质量的贡献者。
+提交 PR 前请阅读 [`docs/code-review-checklist.md`](./docs/code-review-checklist.md) —— **工程宪法**:编码与可维护性、测试、注释、**系统可配/可观测/可关机**;仓库级落地项另见 [`docs/engineering/pulse-conventions.md`](./docs/engineering/pulse-conventions.md)。标准较高,适合重视代码质量的贡献者。
 
 架构类改动请先开 RFC issue 讨论,ADR 机制见 [`docs/adr/`](./docs/adr/)。
 

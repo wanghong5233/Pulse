@@ -5,7 +5,7 @@
 ```
 docs/
 ├── README.md                       本文件
-├── code-review-checklist.md        编码 / 测试宪法（根级,代码中大量引用）
+├── code-review-checklist.md        工程宪法：代码 / 测试 / 注释 / 系统形态（根级,代码中大量引用）
 ├── Pulse实施计划.md                M0-M7 里程碑（根级,规则引用）
 │
 ├── Pulse架构方案.md                全局架构结论
@@ -75,7 +75,7 @@ docs/
 | [Pulse-DomainMemory与Tool模式.md](./Pulse-DomainMemory与Tool模式.md) | DomainMemory 单元、Tool 契约 |
 | [Pulse-MCP优先实施方案.md](./Pulse-MCP优先实施方案.md) | MCP-first 分层与落地验收 |
 | [Pulse命名规则.md](./Pulse命名规则.md) | 品牌、包名、CLI、目录命名 |
-| [code-review-checklist.md](./code-review-checklist.md) | 编码 / 测试宪法（每次 PR 必过） |
+| [code-review-checklist.md](./code-review-checklist.md) | 工程宪法：代码 / 测试 / 注释 / 系统形态 |
 
 ## D. Architecture Decision Records
 
@@ -95,8 +95,10 @@ docs/
 | 文档 | 内容 |
 |---|---|
 | [testing-guide.md](./engineering/testing-guide.md) | 合同测试四形态 + LLM 应用特有测试点 + 反模式 |
+| [pulse-conventions.md](./engineering/pulse-conventions.md) | Pulse 项目级执行约定：Settings、日志、异步、清洁度（根级宪法 §4 的落地项） |
 | [adr-guide.md](./engineering/adr-guide.md) | ADR 写作规范：业界三档对比、Pulse 两档模板、生命周期、反模式 |
 | [agent-concepts.md](./engineering/agent-concepts.md) | Agent 工程概念笔记：Harness / Autonomy Spectrum / HITL·Escalate·Interrupt·Elicitation 辨析 / 五方案对比 / 架构总览 / 术语速查 |
+| [safety-rules-vs-intelligence.md](./engineering/safety-rules-vs-intelligence.md) | 规则与智能的边界：5 产品横向调研 × Pulse 纵向验证 × 4 族双轴模型 × 反模式清单（ADR-006 配套决策留痕） |
 
 ## F. 业务模块设计（`modules/`）
 

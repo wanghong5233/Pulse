@@ -15,8 +15,15 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# v2 起只保留两档: off (不挂 SafetyPlane / 直发) 与 enforce (policy 门控).
+# 旧 "shadow" 档在 v1 ADR 下是 "评估但不阻断", 实际使用中"不阻断"等于
+# 没接入, 只增加审计噪声和代码分支; v2 已去除. 兼容: 旧配置里写了
+# shadow 会被 field_validator 升级为 enforce (就地 fail-loud 迁移).
+_VALID_SAFETY_PLANE_MODES: frozenset[str] = frozenset(("off", "enforce"))
 
 
 class Settings(BaseSettings):
@@ -32,6 +39,16 @@ class Settings(BaseSettings):
     policy_rules_path: str = Field(default="config/policy_rules.json")
     policy_blocked_keywords: str = Field(default="")
     policy_confirm_keywords: str = Field(default="")
+
+    # ── SafetyPlane (ADR-006-v2) ──
+    # off     = 不做授权判决, Service 层直发 (仅本地调试 / 灰度回滚用)
+    # enforce = Service 层的 side-effect 前置跑 policy 函数; ask 分支走
+    #           SuspendedTaskStore 挂起 + 发 IM 问用户; 默认值.
+    safety_plane: str = Field(default="enforce")
+    # SuspendedTaskStore 挂起 / resume 查找都落在同一个 workspace_id, Pulse
+    # 是单用户自部署 (单 workspace), 默认 "default" 即可. 以后真的要多租户
+    # 了, 这里换成 per-user 查表映射 —— 但 MVP 不做那事.
+    safety_workspace_id: str = Field(default="default")
 
     # ── Brain ──
     brain_max_steps: int = Field(default=20, ge=1, le=20)
@@ -99,6 +116,40 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @field_validator("safety_plane")
+    @classmethod
+    def _validate_safety_plane(cls, value: str) -> str:
+        # fail-loud: 拼写错了的 PULSE_SAFETY_PLANE 不应默默降级, 也不应在
+        # Service 层第一次产生 side-effect 时才崩.
+        #
+        # "shadow" 是 v1 ADR-006 的遗留档位, v2 去掉 Brain hook 后不再有意义
+        # (没有 hook 就没有"评估而不阻断"这种状态). 这里把旧值自动升级成
+        # enforce 而不是 raise —— 单用户自部署的用户没法也不该手动迁配置,
+        # 自动把他们带进新默认比给启动失败更友好. 但升级要发 warn, 让本人
+        # 看到行为变了.
+        import logging as _logging
+        import warnings as _warnings
+
+        normalized = (value or "").strip().lower()
+        if normalized == "shadow":
+            _warnings.warn(
+                "PULSE_SAFETY_PLANE=shadow is removed in ADR-006-v2; "
+                "upgrading to 'enforce' (policy gate is now at the service "
+                "layer, shadow mode is no longer meaningful).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            _logging.getLogger(__name__).warning(
+                "PULSE_SAFETY_PLANE=shadow auto-upgraded to 'enforce' (ADR-006-v2)"
+            )
+            normalized = "enforce"
+        if normalized not in _VALID_SAFETY_PLANE_MODES:
+            raise ValueError(
+                f"PULSE_SAFETY_PLANE must be one of {sorted(_VALID_SAFETY_PLANE_MODES)}, "
+                f"got {value!r}"
+            )
+        return normalized
 
 
 @lru_cache

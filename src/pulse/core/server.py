@@ -42,6 +42,13 @@ from .runtime import AgentRuntime, RuntimeConfig
 from .task_context import create_interactive_context
 from .prompt_contract import PromptContractBuilder
 from .hooks import HookContext, HookRegistry, HookResult, HookPoint
+from .safety import (
+    SAFETY_PLANE_ENFORCE,
+    SAFETY_PLANE_OFF,
+    SuspendedTaskStore,
+    WorkspaceSuspendedTaskStore,
+    try_resume_suspended_turn,
+)
 from .compaction import CompactionEngine
 from .memory_reader import MemoryReaderAdapter
 from .promotion import PromotionEngine
@@ -664,6 +671,92 @@ def create_app(
                     _mod.name, _applier, _exc,
                 )
 
+    # ── SafetyPlane (ADR-006-v2) ──────────────────────────────────────
+    # v2 架构: policy 闸门迁到 service 层的 side-effect 入口 (_execute_*),
+    # server 不再向 Brain 的 before_tool_use 注册 hook. 这里只做两件事:
+    #   1. 装配 SuspendedTaskStore (ask 分支挂起任务的持久化后端)
+    #   2. 把 store + workspace_id + mode 注入每个 module 的 service
+    # mode=off 时 store 仍装配但 service.attach_safety_plane 被告知 off,
+    # service 内部会跳过 policy gate (留后门给灰度回滚).
+    _safety_logger = logging.getLogger(__name__ + ".safety")
+    _safety_mode = getattr(settings, "safety_plane", SAFETY_PLANE_OFF)
+    safety_workspace_id: str = str(
+        getattr(settings, "safety_workspace_id", "default") or "default"
+    )
+    safety_suspended_store: SuspendedTaskStore | None = None
+    safety_active_mode: str = SAFETY_PLANE_OFF
+    # Resume → Re-execute 映射: module_name -> ResumedTaskExecutor. 用户答 "y"
+    # 后, ``try_resume_suspended_turn`` 用这张表找到对应业务层回调把原 intent
+    # 立即跑完. 没注册的 module 走降级路径 (resume_outcome.execution.status =
+    # "executor_missing"), 用户会看到明文说明.
+    safety_resumed_executors: dict[str, Any] = {}
+    try:
+        _safety_suspended_store = WorkspaceSuspendedTaskStore(
+            facts=workspace_memory, events=event_bus,
+        )
+        safety_suspended_store = _safety_suspended_store
+        safety_active_mode = _safety_mode
+        # 单用户自部署, 所有 module 的 suspend / resume 落同一个 workspace_id.
+        # 这里传给每个 module 的 value 完全一致 —— 只要 module 和 inbound
+        # resume 都用 ``safety_workspace_id`` 查 store, 就不存在 "挂在 A
+        # 查 B 查不到" 的幽灵. module 若有历史遗留 workspace_id, 在自己的
+        # attach_safety_plane 里覆盖, 但需要保证 inbound resume 仍能命中.
+        for _mod in module_registry.modules:
+            try:
+                _mod.attach_safety_plane(
+                    suspended_store=_safety_suspended_store,
+                    workspace_id=safety_workspace_id,
+                    mode=_safety_mode,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _safety_logger.exception(
+                    "SafetyPlane attach failed for module=%s; module will run in "
+                    "legacy mode (no policy gate)",
+                    _mod.name,
+                )
+                if _safety_mode == SAFETY_PLANE_ENFORCE:
+                    raise RuntimeError(
+                        f"SafetyPlane enforce attach failed for module={_mod.name}"
+                    ) from exc
+            # attach 成功与否都尝试收集 executor —— 两条路径互不耦合: attach
+            # 只关心"挂起"侧, executor 只关心"恢复"侧, 一边坏了另一边仍可用.
+            try:
+                executor = _mod.get_resumed_task_executor()
+            except Exception as exc:  # noqa: BLE001
+                _safety_logger.exception(
+                    "get_resumed_task_executor raised for module=%s; "
+                    "Resume → Re-execute disabled for this module",
+                    _mod.name,
+                )
+                if _safety_mode == SAFETY_PLANE_ENFORCE:
+                    raise RuntimeError(
+                        f"SafetyPlane enforce executor registration failed for module={_mod.name}"
+                    ) from exc
+                executor = None
+            if executor is not None:
+                safety_resumed_executors[_mod.name] = executor
+        _safety_logger.info(
+            "SafetyPlane ready: mode=%s, workspace_id=%s, modules_attached=%d, "
+            "resumed_executors=%s",
+            _safety_mode,
+            safety_workspace_id,
+            len(module_registry.modules),
+            sorted(safety_resumed_executors.keys()),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _safety_logger.exception(
+            "SafetyPlane bootstrap failed; degrading to off for this process "
+            "(mode=%s)",
+            _safety_mode,
+        )
+        if _safety_mode == SAFETY_PLANE_ENFORCE:
+            raise RuntimeError(
+                "SafetyPlane enforce bootstrap failed; refusing to run without gates"
+            ) from exc
+        safety_suspended_store = None
+        safety_active_mode = SAFETY_PLANE_OFF
+        safety_resumed_executors = {}
+
     def _preview(value: Any, *, max_chars: int = 300) -> str:
         if isinstance(value, str):
             text = value
@@ -754,6 +847,45 @@ def create_app(
             # Meta dump is observability, never a hot path: log and carry on.
             logger.exception("trace.meta.write.failed trace_id=%s", trace_id)
 
+    def _send_outgoing_safe(
+        adapters: dict[str, Any],
+        *,
+        channel: str,
+        user_id: str,
+        text: str,
+        kind: str,
+    ) -> bool:
+        """按 channel 取 adapter 发一条 outbound 文本, 吞所有异常留日志.
+
+        返回 True 表示交付给 adapter (不代表远端投递成功, 仅 adapter.send
+        没有 raise); False 表示 adapter 缺失或 send 抛错. 调用方用它决定
+        是否发告警事件, 但绝不让它打断主链路 —— AskRequest 通知失败也不能
+        让 Brain 的 turn 标成 server error.
+        """
+        if not text:
+            return False
+        adapter = adapters.get(channel)
+        if adapter is None:
+            logger.warning(
+                "outgoing.adapter.missing channel=%s kind=%s; message dropped",
+                channel, kind,
+            )
+            return False
+        try:
+            adapter.send(OutgoingMessage(
+                channel=channel,
+                target_id=user_id,
+                text=text,
+                metadata={"kind": kind},
+            ))
+            return True
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "outgoing.send.failed channel=%s kind=%s user_id=%s",
+                channel, kind, user_id,
+            )
+            return False
+
     async def _dispatch_channel_message(message: IncomingMessage) -> dict[str, Any]:
         metadata = dict(message.metadata)
         metadata["channel"] = message.channel
@@ -761,8 +893,15 @@ def create_app(
         if not str(metadata.get("session_id") or "").strip():
             metadata["session_id"] = f"{message.channel}:{message.user_id}"
 
+        session_id = str(metadata.get("session_id") or "")
+        # Pulse 单用户自部署, IM 会话与 workspace 仍保持一对一 (session 就是
+        # workspace), 但 SafetyPlane 的 SuspendedTaskStore 独立走全局
+        # safety_workspace_id —— 这样 Brain 的会话态和 SafetyPlane 的挂起态
+        # 可以按不同生命周期管理 (前者跟随 session 老化, 后者必须跨 session
+        # 持久, 直到用户答 y/n 为止).
         ctx = create_interactive_context(
-            session_id=str(metadata.get("session_id") or ""),
+            session_id=session_id,
+            workspace_id=session_id,
             extra={"channel": message.channel, "user_id": message.user_id},
         )
         trace_id = ctx.trace_id
@@ -789,6 +928,113 @@ def create_app(
                 "text_preview": _preview(message.text, max_chars=220),
             },
         )
+
+        # 入站前置 Resume 检查: 全局 safety_workspace_id 若有 awaiting
+        # SuspendedTask, 本条消息视为对它的回答, 不跑 IntentRouter / Brain,
+        # 直接 resolve + 给用户回确认. Store 未初始化 (mode=off / bootstrap
+        # 失败) 一律走常规链路.
+        if (
+            safety_suspended_store is not None
+            and safety_active_mode == SAFETY_PLANE_ENFORCE
+        ):
+            resume_outcome = try_resume_suspended_turn(
+                store=safety_suspended_store,
+                workspace_id=safety_workspace_id,
+                user_text=message.text,
+                received_at=message.received_at,
+                executors=safety_resumed_executors or None,
+            )
+            if resume_outcome.should_skip_brain:
+                resume_latency_ms = int((time.perf_counter() - started_at) * 1000)
+                execution_payload: dict[str, Any] | None = None
+                if resume_outcome.execution is not None:
+                    execution_payload = {
+                        "status": resume_outcome.execution.status,
+                        "ok": bool(resume_outcome.execution.ok),
+                        "summary": resume_outcome.execution.summary,
+                    }
+                resume_response: dict[str, Any] = {
+                    "channel": message.channel,
+                    "user_id": message.user_id,
+                    "text": message.text,
+                    "trace_id": trace_id,
+                    "handled": resume_outcome.kind == "resolved",
+                    "result": {
+                        "resume": {
+                            "kind": resume_outcome.kind,
+                            "task_id": (
+                                resume_outcome.task.task_id
+                                if resume_outcome.task is not None
+                                else None
+                            ),
+                            "execution": execution_payload,
+                        }
+                    },
+                    "latency_ms": resume_latency_ms,
+                }
+                if resume_outcome.should_reply:
+                    _send_outgoing_safe(
+                        channel_adapters,
+                        channel=message.channel,
+                        user_id=message.user_id,
+                        text=resume_outcome.user_reply,
+                        kind="resume_reply",
+                    )
+                _emit_event(
+                    "channel.message.resumed",
+                    {
+                        "trace_id": trace_id,
+                        "channel": message.channel,
+                        "user_id": message.user_id,
+                        "resume_kind": resume_outcome.kind,
+                        "task_id": (
+                            resume_outcome.task.task_id
+                            if resume_outcome.task is not None
+                            else None
+                        ),
+                        "execution_status": (
+                            resume_outcome.execution.status
+                            if resume_outcome.execution is not None
+                            else None
+                        ),
+                        "execution_ok": (
+                            bool(resume_outcome.execution.ok)
+                            if resume_outcome.execution is not None
+                            else None
+                        ),
+                        "execution_summary": (
+                            resume_outcome.execution.summary
+                            if resume_outcome.execution is not None
+                            else None
+                        ),
+                        "execution_detail": (
+                            dict(resume_outcome.execution.detail)
+                            if resume_outcome.execution is not None
+                            else None
+                        ),
+                        "latency_ms": resume_latency_ms,
+                    },
+                )
+                logger.info(
+                    "channel.msg.resumed channel=%s kind=%s task_id=%s "
+                    "exec_status=%s exec_ok=%s latency_ms=%d",
+                    message.channel,
+                    resume_outcome.kind,
+                    resume_outcome.task.task_id if resume_outcome.task else "-",
+                    (
+                        resume_outcome.execution.status
+                        if resume_outcome.execution is not None
+                        else "-"
+                    ),
+                    (
+                        resume_outcome.execution.ok
+                        if resume_outcome.execution is not None
+                        else "-"
+                    ),
+                    resume_latency_ms,
+                )
+                return resume_response
+
         route = intent_router.resolve(message.text)
         policy = policy_engine.evaluate(
             intent=route.intent,
@@ -978,6 +1224,12 @@ def create_app(
                         "observation_preview": _preview(step.observation, max_chars=240),
                     },
                 )
+
+        # v2 起 Brain 不再参与 safety 判决; Ask 分支的 IM 外发由
+        # Service 层自己完成 (通过 Notifier 回传到对应 channel), 或者由
+        # ``channel.message.completed`` 之后的 patrol 循环再次扫到挂起任务
+        # 时, 通过 WorkspaceSuspendedTaskStore 事件触发 channel adapter.
+        # 因此 server 这里不再解析 Brain.stopped_reason 来做 ask 出站.
         _emit_event(
             "channel.message.completed",
             {

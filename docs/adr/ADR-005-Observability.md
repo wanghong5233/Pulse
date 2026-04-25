@@ -52,7 +52,7 @@ logs/
 | 分桶成本 | 单 turn 日志行数 ≤ 10³, 文件数 ≤ 2; open/close FD 在 turn 尺度可忽略 | 为每个 trace 独立开 `FileHandler` 成本可接受 |
 | 保留策略 | 桶是短寿 artifact (post-mortem 后可删); rotate 单桶无意义 | 主 `pulse.log` 走 `TimedRotatingFileHandler`; 桶文件平铺, 清理由未来 cron 负责 |
 | 跨进程传递 | MCP 协议 body 是 JSON-RPC 规范定义, 不可扩展; HTTP header 是唯一合规注入面 | `X-Pulse-Trace-Id` header, 空 trace (`-`) 不注入以免污染 |
-| 宪法合规 | `code-review-checklist.md` §5 要求"全埋点 + 不混桶", event bus 不写 logger 是静默黑洞 | `emit_stage_event` 必须镜像一条 `logger.info`, 否则所有 service 层 stage 事件完全不在 `pulse.log` 中 |
+| 宪法合规 | `code-review-checklist.md` §4/§1 可观测、fail-fast 与「不伪造静默成功」的取向; event bus 不写 logger 是静默黑洞 | `emit_stage_event` 必须镜像一条 `logger.info`, 否则所有 service 层 stage 事件完全不在 `pulse.log` 中 |
 
 ---
 
