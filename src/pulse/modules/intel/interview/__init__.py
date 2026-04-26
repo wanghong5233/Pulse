@@ -1,1 +1,0 @@
-"""Intel-domain interview capability."""

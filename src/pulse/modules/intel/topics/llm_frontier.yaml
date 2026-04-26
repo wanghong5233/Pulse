@@ -1,0 +1,47 @@
+id: llm_frontier
+display_name: 大模型前沿
+description: LLM 工程化 / Agent 框架 / 模型评测的最新进展，覆盖一线 lab 与社区。
+
+sources:
+  - type: rss
+    url: https://openai.com/blog/rss.xml
+    weight: 1.0
+    label: OpenAI Blog
+  - type: rss
+    url: https://www.anthropic.com/news/rss.xml
+    weight: 1.0
+    label: Anthropic News
+  - type: rss
+    url: https://huggingface.co/blog/feed.xml
+    weight: 0.9
+    label: Hugging Face Blog
+  - type: rss
+    url: https://blog.langchain.dev/rss/
+    weight: 0.8
+    label: LangChain Blog
+
+scoring:
+  threshold: 6.5
+  rubric_prompt: |
+    评分维度（每项 0-10，最终 score 取均值）：
+    1. depth：技术深度（vs 营销 / 速食内容）
+    2. novelty：新颖度（是否引入新概念 / 方法 / 数据点）
+    3. impact：工程实用性（vs 纯学术，是否能直接落地）
+    倾向高分：可复现的工程报告、官方架构 / 评测、有代码 / 数字支撑的研究。
+    倾向低分：纯产品宣发、公关稿、没有新增信息量的转译。
+  rubric_dimensions: [depth, novelty, impact]
+
+diversity:
+  max_per_source: 2
+  serendipity_slots: 1
+  contrarian_bonus: 0.5
+
+publish:
+  schedule_cron: "0 9 * * *"
+  channel: feishu
+  format: digest_zh
+  peak_interval_seconds: 3600
+  offpeak_interval_seconds: 21600
+
+memory:
+  promote_threshold: 8.5

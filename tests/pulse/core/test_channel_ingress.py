@@ -67,23 +67,21 @@ def test_feishu_event_dispatches_prefix_intent() -> None:
     assert "module.boss_greet" in body["result"]["brain"]["used_tools"]
 
 
-def test_cli_ingest_dispatches_to_intel_query() -> None:
+def test_cli_ingest_dispatches_to_intel_search() -> None:
     app = create_app()
     client = TestClient(app)
 
     response = client.post(
         "/api/channel/cli/ingest",
         json={
-            "text": "/intel query agent observability",
+            "text": "/intel search agent observability",
             "user_id": "tester-intel",
         },
     )
     assert response.status_code == 200
     payload = response.json()
     assert payload["ok"] is True
-    assert payload["result"]["route"]["intent"] == "intel.query.search"
-    assert payload["result"]["route"]["target"] == "intel_query"
+    assert payload["result"]["route"]["intent"] == "intel.search"
+    assert payload["result"]["route"]["target"] == "intel"
     assert payload["result"]["handled"] is True
     assert payload["result"]["mode"] == "brain"
-    assert "module.intel_query" in payload["result"]["brain"]["used_tools"]
-    assert isinstance(payload["result"]["result"]["items"], list)

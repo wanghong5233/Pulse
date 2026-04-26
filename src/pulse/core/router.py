@@ -41,7 +41,7 @@ class IntentRouter:
     **command-style 前缀输入**路由到对应业务 target. 自然语言输入(例如
     "帮我投递 5 个 JD") 应该**直接交给 Brain** 的 ReAct + tool-use 机制决定,
     不在这里做 LLM 意图猜测:
-      - 准确率低 (``router_rules.json`` 缺失 job.* 时会误分到 intel.interview.collect)
+      - 准确率低 (``router_rules.json`` 缺失 job.* 时会误分到 intel.search 等)
       - 多花一次 classification LLM 调用 (3s+)
       - 结果通常被 Brain 忽略, 只制造 trace 噪声
 

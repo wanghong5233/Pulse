@@ -3,6 +3,10 @@ name: pulse
 # Default stack:
 #   - `docker compose up -d postgres pulse-api` starts the full stack.
 #   - `docker compose up -d postgres` starts only the DB sidecar.
+#   - `docker compose --profile rsshub up -d rsshub redis-rsshub` starts the
+#     optional self-hosted RSSHub for the intel module. Public mirrors
+#     (rsshub.app / rsshub.rssforever.com) are still tried as fallback, so
+#     the intel pipeline works without this profile too.
 #
 # Environment variables feed in from `.env`; anything not listed here falls
 # back to the application defaults in `src/pulse/core/config.py`.
@@ -65,8 +69,11 @@ services:
       NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
       PULSE_FEISHU_SIGN_SECRET: ${PULSE_FEISHU_SIGN_SECRET:-}
 
-      INTEL_INTERVIEW_PUSH_INTERVAL_SEC: ${INTEL_INTERVIEW_PUSH_INTERVAL_SEC:-3600}
-      INTEL_TECHRADAR_PUSH_INTERVAL_SEC: ${INTEL_TECHRADAR_PUSH_INTERVAL_SEC:-3600}
+      # Intel module — RSSHub instances tried in order. Self-hosted
+      # rsshub:1200 is only present when the `rsshub` profile is up; the
+      # public mirrors still resolve when the profile is off, so the
+      # intel pipeline degrades gracefully instead of failing the patrol.
+      PULSE_INTEL_RSSHUB_INSTANCES: ${PULSE_INTEL_RSSHUB_INSTANCES:-http://rsshub:1200,https://rsshub.app,https://rsshub.rssforever.com}
     volumes:
       - pulse_memory_data:/root/.pulse
     ports:
@@ -74,6 +81,46 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  # ── Optional: self-hosted RSSHub for the intel module ───────────────────
+  # Run with `docker compose --profile rsshub up -d`. RSSHub itself is
+  # stateless; the redis sidecar is its cache (image upstream defaults).
+  # Healthchecks let pulse-api treat RSSHub as a soft dependency: the
+  # module's RssFetcher probes the instance before each request and falls
+  # back to public mirrors when it's not ready.
+  rsshub:
+    image: diygod/rsshub:latest
+    container_name: pulse-rsshub
+    profiles: ["rsshub"]
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      CACHE_TYPE: redis
+      REDIS_URL: redis://redis-rsshub:6379/
+      REQUEST_RETRY: "1"
+      REQUEST_TIMEOUT: "8000"
+    ports:
+      - "1200:1200"
+    depends_on:
+      redis-rsshub:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:1200/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  redis-rsshub:
+    image: redis:7-alpine
+    container_name: pulse-rsshub-redis
+    profiles: ["rsshub"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
 volumes:
   pulse_pg_data:

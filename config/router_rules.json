@@ -1,7 +1,7 @@
 {
   "_comment_purpose": "Legacy slash-command router (see docs/Pulse-DomainMemory与Tool模式.md §3.4).",
-  "_comment_status": "Being phased out. All slash commands SHOULD reach the Brain (which has intent tools + command_conventions prompt). Rules below are kept only for business modules that have not yet migrated to IntentSpec. New modules MUST NOT add entries here.",
-  "_comment_migration": "job_profile / job_greet / job_chat have all migrated to IntentSpec tools — their rules are removed. Remaining entries are for email / intel which still use coarse handle_intent; remove them once those modules adopt IntentSpec. /help is handled by Brain system prompt (prompt_contract.py _section_command_conventions).",
+  "_comment_status": "Being phased out. Natural-language inputs go directly to Brain; only slash-command shortcuts remain here. Modules with full IntentSpec coverage (job_*, intel) do not need entries.",
+  "_comment_migration": "intel.* entries removed when the intel module migrated to a single deterministic-workflow IntelModule with IntentSpec tools (intel.digest.* / intel.search). Slash shortcuts that hit the same tools live below for muscle-memory users.",
 
   "fallback_intent": "general.default",
   "fallback_target": "hello",
@@ -9,23 +9,23 @@
     "general.default": "hello",
     "email.process": "email_tracker",
     "email.fetch": "email_tracker",
-    "intel.interview.collect": "intel_interview",
-    "intel.interview.report": "intel_interview",
-    "intel.techradar.collect": "intel_techradar",
-    "intel.techradar.report": "intel_techradar",
-    "intel.query.search": "intel_query"
+    "intel.digest.list": "intel",
+    "intel.digest.latest": "intel",
+    "intel.digest.run": "intel",
+    "intel.search": "intel"
   },
   "exact": [
     { "key": "ping", "intent": "general.default" },
-    { "key": "/ping", "intent": "general.default" }
+    { "key": "/ping", "intent": "general.default" },
+    { "key": "/intel digest", "intent": "intel.digest.list" },
+    { "key": "/intel list", "intent": "intel.digest.list" }
   ],
   "prefix": [
     { "prefix": "/email process", "intent": "email.process" },
     { "prefix": "/email fetch", "intent": "email.fetch" },
-    { "prefix": "/intel interview collect", "intent": "intel.interview.collect" },
-    { "prefix": "/intel interview report", "intent": "intel.interview.report" },
-    { "prefix": "/intel radar collect", "intent": "intel.techradar.collect" },
-    { "prefix": "/intel radar report", "intent": "intel.techradar.report" },
-    { "prefix": "/intel query", "intent": "intel.query.search" }
+    { "prefix": "/intel digest list", "intent": "intel.digest.list" },
+    { "prefix": "/intel digest latest", "intent": "intel.digest.latest" },
+    { "prefix": "/intel digest run", "intent": "intel.digest.run" },
+    { "prefix": "/intel search", "intent": "intel.search" }
   ]
 }

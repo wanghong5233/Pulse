@@ -1,0 +1,43 @@
+id: autumn_recruit
+display_name: 秋招动态
+description: 校招 / 实习招聘的进度、岗位放出、批次节奏，覆盖大厂 + AI lab + 牛客社区。
+
+sources:
+  - type: rss
+    url: https://rsshub.app/nowcoder/discuss/2  # 牛客实习板块（占位，正式启用前先确认 RSSHub 路由可访问）
+    weight: 1.0
+    label: 牛客实习
+  - type: rss
+    url: https://rsshub.app/nowcoder/discuss/3  # 牛客校招板块
+    weight: 1.0
+    label: 牛客校招
+  - type: web_search
+    query: "2026 校招 算法 大模型 内推"
+    weight: 0.7
+    max_results: 8
+
+scoring:
+  threshold: 6.0
+  rubric_prompt: |
+    评分维度：
+    1. depth：信息颗粒度（具体岗位 / 时间 / 链接 vs 模糊抱怨）
+    2. novelty：是否本周新增信息
+    3. impact：对正在求职的应届 / 实习生的实际价值
+    高分：明确的批次开放 / 流程更新 / 内推码 / 笔试时间；
+    低分：纯吐槽、过期消息、与求职无关的杂谈。
+  rubric_dimensions: [depth, novelty, impact]
+
+diversity:
+  max_per_source: 3
+  serendipity_slots: 0
+  contrarian_bonus: 0.0
+
+publish:
+  schedule_cron: "30 8 * * 1-5"
+  channel: feishu
+  format: digest_zh
+  peak_interval_seconds: 1800
+  offpeak_interval_seconds: 14400
+
+memory:
+  promote_threshold: 8.0

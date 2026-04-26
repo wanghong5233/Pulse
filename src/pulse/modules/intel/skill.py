@@ -1,8 +1,9 @@
 """Intel domain skill schema.
 
-Declares the *domain-level* capability surface for the intelligence domain
-(面经 / 技术雷达 / 知识查询).  Consumed by the Brain / router to perform
-two-level routing (domain → sub-capability).
+Declares the *domain-level* capability surface for the intelligence domain.
+After the 2026 refactor the domain has a single capability — `digest` — that
+runs the deterministic six-stage workflow per declared topic, plus a
+search tool for ad-hoc retrieval over the persisted corpus.
 """
 
 from __future__ import annotations
@@ -12,47 +13,37 @@ from typing import Any
 SKILL_SCHEMA: dict[str, Any] = {
     "name": "intel",
     "description": (
-        "情报域技能包：面向求职者与技术工程师的长期知识基建，覆盖面经收集、"
-        "技术雷达信号与本地知识库语义检索。"
+        "情报域技能包：以确定性 workflow 订阅多渠道信号，按主题去重 / 评分 / "
+        "摘要，产出日报推送并把高分条目沉淀到长期记忆。新增主题只需追加一个 "
+        "YAML 文件，不改代码。"
     ),
     "subcapabilities": [
         {
-            "name": "interview",
-            "module": "intel_interview",
-            "description": "从 Web 搜索结果中抓取并结构化面经情报，可定时推送日报",
+            "name": "digest",
+            "module": "intel",
+            "description": (
+                "按主题运行 fetch → dedup → score → summarize → diversify → "
+                "publish 六步 workflow，列出 / 取最新 / 立即触发。"
+            ),
             "intents": [
-                "intel.interview.collect",
-                "intel.interview.report",
+                "intel.digest.list",
+                "intel.digest.latest",
+                "intel.digest.run",
             ],
             "examples": [
-                "收集 AI Agent 的最新面经",
-                "给我一份 RAG 实习岗位的面经日报",
-                "/intel interview collect AI Agent",
+                "看一下最新的大模型前沿情报",
+                "立刻跑一遍秋招主题",
+                "/intel digest list",
             ],
         },
         {
-            "name": "techradar",
-            "module": "intel_techradar",
-            "description": "收集技术趋势信号并生成信号评分 + 行动建议",
-            "intents": [
-                "intel.techradar.collect",
-                "intel.techradar.report",
-            ],
+            "name": "search",
+            "module": "intel",
+            "description": "跨主题关键词检索已落库的 intel 文档，供 Brain ReAct 引用。",
+            "intents": ["intel.search"],
             "examples": [
-                "帮我扫一下 MCP 相关的技术雷达",
-                "/intel radar collect Agent Observability",
-            ],
-        },
-        {
-            "name": "query",
-            "module": "intel_query",
-            "description": "对已收集的情报做语义检索 / 分类过滤",
-            "intents": [
-                "intel.query.search",
-            ],
-            "examples": [
-                "查一下 Claude Code 对 MCP 的安全治理怎么做",
-                "/intel query agent 超时",
+                "你之前看到的那篇 MCP 安全治理文章是哪一篇？",
+                "/intel search agent observability",
             ],
         },
     ],

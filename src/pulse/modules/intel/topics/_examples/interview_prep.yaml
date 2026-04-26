@@ -1,0 +1,39 @@
+id: interview_prep
+display_name: 面经
+description: 大模型 / Agent / 工程方向的真实面经，覆盖一面到主管面，重点筛选具体题目和反馈。
+
+sources:
+  - type: rss
+    url: https://rsshub.app/nowcoder/discuss/9  # 牛客面经板块（启用前确认路由）
+    weight: 1.0
+    label: 牛客面经
+  - type: web_search
+    query: "AI Agent 面经 大模型 工程"
+    weight: 0.8
+    max_results: 10
+
+scoring:
+  threshold: 6.0
+  rubric_prompt: |
+    评分维度：
+    1. depth：题目颗粒度（具体题面 + 反问 vs 流水账）
+    2. novelty：是否近 1 个月内的面试经历
+    3. impact：题目对当下求职者的复用价值（多人会被问到）
+    高分：题目 + 标准答案思路 + 面试官反馈三件套齐全；
+    低分：纯情绪输出、与岗位无关的吐槽、过期 1 年以上的题。
+  rubric_dimensions: [depth, novelty, impact]
+
+diversity:
+  max_per_source: 4
+  serendipity_slots: 0
+  contrarian_bonus: 0.0
+
+publish:
+  schedule_cron: "0 20 * * 1-5"
+  channel: feishu
+  format: digest_zh
+  peak_interval_seconds: 3600
+  offpeak_interval_seconds: 21600
+
+memory:
+  promote_threshold: 8.5

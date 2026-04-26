@@ -47,11 +47,13 @@ modules/
 │   │   └── boss/               Boss 直聘平台实现
 │   ├── greet/module.py         job_greet(扫描 + 打招呼)
 │   └── chat/module.py          job_chat (HR 对话处理)
-├── intel/                      情报域
-│   ├── skill.py
-│   ├── interview/module.py     intel_interview(面经采集)
-│   ├── techradar/module.py     intel_techradar(技术雷达)
-│   └── query/module.py         intel_query  (语义检索)
+├── intel/                      情报域(单 module 多主题)
+│   ├── skill.py                领域级 SKILL_SCHEMA
+│   ├── module.py               intel(确定性 6 步 workflow + 主题 YAML)
+│   ├── pipeline/               fetch → dedup → score → summarize → diversify → publish
+│   ├── sources/                SourceFetcher 实现(rss / web_search / ...)
+│   ├── topics/                 主题 YAML 配置;新增主题 = 加文件
+│   └── docs/                   模块内开发文档
 ├── email/                      邮件域
 │   ├── skill.py
 │   └── tracker/module.py       email_tracker
@@ -64,9 +66,9 @@ modules/
 **命名约定**
 
 - 目录:`modules/<domain>/<capability>/`,小写、单数,层次反映路由结构。
-- 类名:`<Domain><Capability>Module`,例如 `JobGreetModule`、`IntelInterviewModule`。
-- `BaseModule.name`:稳定业务标识 (如 `job_greet` / `intel_interview` / `feedback_loop`),用于 intent 路由、日志、事件、存储 key,**一经设定不随目录改名**。
-- `route_prefix`:与目录层级一致,例如 `/api/modules/job/greet`、`/api/modules/intel/interview`。
+- 类名:`<Domain><Capability>Module`,例如 `JobGreetModule`、`EmailTrackerModule`;单 capability 域(如 `intel`)直接 `IntelModule`。
+- `BaseModule.name`:稳定业务标识 (如 `job_greet` / `intel` / `feedback_loop`),用于 intent 路由、日志、事件、存储 key,**一经设定不随目录改名**。
+- `route_prefix`:与目录层级一致,例如 `/api/modules/job/greet`、`/api/modules/intel`。
 
 **为什么要两层 (domain → capability) 而不是扁平?**
 

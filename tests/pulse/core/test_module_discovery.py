@@ -18,10 +18,8 @@ def test_health_lists_phase1_modules() -> None:
     modules = set(data.get("modules", []))
     assert {
         "hello",
-        "boss_greet",
-        "boss_chat",
+        "job_greet",
+        "job_chat",
         "email_tracker",
-        "intel_interview",
-        "intel_techradar",
-        "intel_query",
+        "intel",
     }.issubset(modules)

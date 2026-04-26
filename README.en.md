@@ -45,10 +45,10 @@ To do that, Pulse cleanly separates a generic **agent kernel** from **domain ski
 
 - **Kernel** (`core/`) is domain-agnostic — long-horizon scheduling, five-layer memory, contract-based tool use, event auditing, and personality evolution in one place.
 - **Skill packs** (`modules/`) are grouped by domain; new scenarios add directories without changing the framework.
-- **The first shipped skill pack is job search** — BOSS Zhipin JD scanning, proactive outreach, auto-replies in HR chats, resume delivery, and email tracking end-to-end.
+- **Shipped skill packs**: job search (BOSS Zhipin JD scan / proactive outreach / HR auto-reply / résumé delivery), intel digest (multi-topic YAML packs driving a six-stage pipeline + cross-topic search), and email tracking (IMAP classification + schedule extraction).
 - **The real technical depth** sits in three places — three-contract tool use (against agent hallucination), Layer × Scope five-layer memory, and the long-running `AgentRuntime` kernel (patrol + circuit breaking + event bus).
 
-Job search is only the first scenario. Once the kernel stabilizes, **every life workflow worth automating becomes Pulse's next destination** — automating daily game check-ins, generating end-to-end travel plans, tracking inbox and finance, orchestrating smart-home devices, even synthesizing new skills and accumulating habits and preferences uniquely yours. One kernel, an unbounded set of skill packs.
+This is only the beginning. **Every life workflow worth automating becomes Pulse's next destination** — automating daily game check-ins, generating end-to-end travel plans, weekly finance reports, orchestrating smart-home devices, even synthesizing new skills and accumulating habits and preferences uniquely yours. One kernel, an unbounded set of skill packs.
 
 ---
 
@@ -259,11 +259,12 @@ Pulse’s current skill packs focus on job search, but the kernel is already gen
 
 ### Intel domain `modules/intel/`
 
-| Sub-capability | What it does |
+A single Module assembled from topic YAMLs — adding a new topic (autumn recruiting, interview prep, LLM frontier, …) is a config change, not a code change.
+
+| Capability | What it does |
 |---|---|
-| **interview** | Interview intel harvest → LLM extract signals → aggregate by company → IM digest (WeCom / Feishu) |
-| **techradar** | Tech radar (RSS / GitHub Trending / WeChat) → LLM relevance → summary → digest |
-| **query** | Semantic intel search + category filters |
+| **digest** | Per-topic deterministic six-stage pipeline: fetch → dedup → score → summarize → diversify → publish, across RSS / GitHub Trending / Web Search. Anti-cocoon controls (source quotas + serendipity slots + contrarian bonus) are first-class workflow citizens; high-score items get promoted into ArchivalMemory. |
+| **search** | Cross-topic keyword retrieval (LLM extracts terms → SQL ILIKE), reachable from Brain ReAct and any external MCP client (Claude Desktop / Cursor). |
 
 ### Email domain `modules/email/tracker/`
 
@@ -373,7 +374,7 @@ Pulse/
 │   │
 │   ├── modules/                 ← domain skill packs (pluggable)
 │   │   ├── job/                 job: greet / chat / profile / _connectors/boss
-│   │   ├── intel/               intel: interview / techradar / query
+│   │   ├── intel/               intel: digest pipeline + search (multi-topic via YAML)
 │   │   ├── email/tracker/       email
 │   │   └── system/              system: hello / feedback / patrol
 │   │
