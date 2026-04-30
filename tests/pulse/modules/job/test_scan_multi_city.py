@@ -64,8 +64,11 @@ class _RecorderConnector(JobPlatformConnector):
         self,
         *,
         keyword: str,
-        max_items: int,
-        max_pages: int,
+        max_items: int | None = None,
+        max_pages: int | None = None,
+        target_count: int | None = None,
+        evaluation_cap: int | None = None,
+        scroll_plateau_rounds: int | None = None,
         job_type: str = "all",
         city: str | None = None,
     ) -> dict[str, Any]:
@@ -74,6 +77,9 @@ class _RecorderConnector(JobPlatformConnector):
                 "keyword": keyword,
                 "max_items": max_items,
                 "max_pages": max_pages,
+                "target_count": target_count,
+                "evaluation_cap": evaluation_cap,
+                "scroll_plateau_rounds": scroll_plateau_rounds,
                 "job_type": job_type,
                 "city": city,
             }
@@ -90,7 +96,15 @@ class _RecorderConnector(JobPlatformConnector):
             }
         ]
         items = self._results_by_city.get(city, default_items)
-        return {"ok": True, "items": list(items), "pages_scanned": 1, "source": "recorder", "errors": []}
+        return {
+            "ok": True,
+            "items": list(items),
+            "pages_scanned": 1,
+            "scroll_count": 0,
+            "exhausted": True,
+            "source": "recorder",
+            "errors": [],
+        }
 
     def fetch_job_detail(self, *, job_id: str, source_url: str) -> dict[str, Any]:
         return {"ok": True, "detail": {}, "source": "recorder"}

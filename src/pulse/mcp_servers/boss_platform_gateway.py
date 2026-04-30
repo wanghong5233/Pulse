@@ -67,6 +67,19 @@ def _build_tools() -> dict[str, _ToolSpec]:
             schema={"type": "object", "properties": {}},
             handler=lambda args: runtime.health(),
         ),
+        "reset_browser_session": _ToolSpec(
+            name="reset_browser_session",
+            description="Close and recreate browser session on next call",
+            schema={
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string"},
+                },
+            },
+            handler=lambda args: runtime.reset_browser_session(
+                reason=str(args.get("reason") or "manual").strip() or "manual",
+            ),
+        ),
         "check_login": _ToolSpec(
             name="check_login",
             description="Validate BOSS login session",
@@ -82,13 +95,47 @@ def _build_tools() -> dict[str, _ToolSpec]:
         ),
         "scan_jobs": _ToolSpec(
             name="scan_jobs",
-            description="Scan jobs from BOSS sources",
+            description=(
+                "Scan jobs from BOSS sources. Streaming scroll on the live "
+                "search sidebar (BOSS is an infinite-scroll SPA) until "
+                "target_count is satisfied, evaluation_cap hits, or the "
+                "list plateaus. Returned payload always carries `exhausted` "
+                "so the host can decide whether to evolve keywords."
+            ),
             schema={
                 "type": "object",
                 "properties": {
                     "keyword": {"type": "string"},
-                    "max_items": {"type": "integer", "minimum": 1, "maximum": 80},
-                    "max_pages": {"type": "integer", "minimum": 1, "maximum": 8},
+                    "target_count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "Desired # of cards before early stop.",
+                    },
+                    "evaluation_cap": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "Hard ceiling on collected cards.",
+                    },
+                    "scroll_plateau_rounds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8,
+                        "description": "# of consecutive empty scrolls before declaring exhausted.",
+                    },
+                    "max_items": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "Deprecated alias for target_count.",
+                    },
+                    "max_pages": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8,
+                        "description": "Deprecated; pre-scroll back-compat budget hint.",
+                    },
                     "job_type": {"type": "string"},
                     "city": {
                         "type": "string",
@@ -102,8 +149,14 @@ def _build_tools() -> dict[str, _ToolSpec]:
             },
             handler=lambda args: runtime.scan_jobs(
                 keyword=str(args.get("keyword") or "").strip(),
-                max_items=int(args.get("max_items") or 10),
-                max_pages=int(args.get("max_pages") or 2),
+                max_items=int(args["max_items"]) if args.get("max_items") is not None else None,
+                max_pages=int(args["max_pages"]) if args.get("max_pages") is not None else None,
+                target_count=int(args["target_count"]) if args.get("target_count") is not None else None,
+                evaluation_cap=int(args["evaluation_cap"]) if args.get("evaluation_cap") is not None else None,
+                scroll_plateau_rounds=(
+                    int(args["scroll_plateau_rounds"])
+                    if args.get("scroll_plateau_rounds") is not None else None
+                ),
                 job_type=str(args.get("job_type") or "all"),
                 city=(str(args.get("city") or "").strip() or None),
             ),

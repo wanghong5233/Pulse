@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pulse.core.event_types import should_persist
 from pulse.core.events import EventBus, InMemoryEventStore
 
 
@@ -46,3 +47,23 @@ def test_in_memory_event_store_recent_stats_and_clear() -> None:
     removed = store.clear()
     assert removed == 3
     assert store.recent(limit=10) == []
+
+
+def test_should_persist_keeps_audit_decision_events_for_job_greet() -> None:
+    """Behavioral pin: agent reflexion / per-JD verdict events MUST be
+    persisted to the audit JSONL. Without them post-mortem can't tell
+    "really nothing matched" from "rule misfire" — exactly the failure
+    mode that triggered ADR-006 reflexion redesign.
+
+    High-volume sibling events (channel.* / module.*.scan / ...) stay
+    out of the audit sink by design; this test guards the boundary.
+    """
+    assert should_persist("module.job_greet.match.candidate") is True
+    assert should_persist("module.job_greet.trigger.reflection") is True
+    # Sibling stages stay off-disk to keep the audit volume bounded.
+    assert should_persist("module.job_greet.scan.started") is False
+    assert should_persist("module.job_greet.trigger.started") is False
+    # Pre-existing audit prefixes still work.
+    assert should_persist("brain.commitment.unfulfilled") is True
+    assert should_persist("preference.domain.applied") is True
+    assert should_persist("channel.message.received") is False

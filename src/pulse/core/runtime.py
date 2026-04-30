@@ -14,6 +14,8 @@ P3 additions:
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import os
 import time
@@ -365,6 +367,25 @@ class AgentRuntime:
         finally:
             set_trace_id(None)
 
+    @staticmethod
+    def _resolve_handler_result(result: Any, *, source: str) -> Any:
+        """Resolve a handler return value; run awaitables explicitly.
+
+        Runtime public APIs are sync. If a handler returns an awaitable,
+        execute it in a fresh loop when no loop is running, otherwise fail
+        loudly so callers don't get a silent "completed" with unexecuted coro.
+        """
+        if not inspect.isawaitable(result):
+            return result
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(result)
+        raise RuntimeError(
+            f"{source} handler returned awaitable inside active event loop; "
+            "invoke this runtime path from sync context or make caller await it."
+        )
+
     def _execute_patrol_body(
         self,
         ctx: TaskContext,
@@ -489,6 +510,7 @@ class AgentRuntime:
 
         try:
             result = handler(ctx)
+            result = self._resolve_handler_result(result, source="patrol")
 
             # L2 — degrade: handler 返回 {ok: false}
             if isinstance(result, dict) and result.get("ok") is False:
@@ -674,6 +696,55 @@ class AgentRuntime:
             })
             self._started_at = None
         return was_running
+
+    def disarm_patrols(self, *, actor: str = "system") -> dict[str, Any]:
+        """Disable all user-controllable patrols and persist the state.
+
+        This operation is lifecycle-only (no business handler execution).
+        It is the safety counterpart of ``start``/``stop`` for scenarios
+        where operators want "stop means no auto actions after restart".
+        """
+        disabled: list[str] = []
+        already_disabled: list[str] = []
+        failed: list[dict[str, str]] = []
+
+        for name in self._runner.engine.list_tasks():
+            if name == self._heartbeat_task_name:
+                continue
+            snapshot = self._patrol_snapshot(name)
+            if snapshot is None:
+                continue
+            if not bool(snapshot.get("enabled")):
+                already_disabled.append(name)
+                continue
+            try:
+                ok = self.disable_patrol(name, actor=actor)
+            except OSError as exc:
+                failed.append({"name": name, "error": str(exc)})
+                continue
+            if ok:
+                disabled.append(name)
+            else:
+                failed.append({"name": name, "error": "not found or not controllable"})
+
+        result = {
+            "actor": actor,
+            "disabled": disabled,
+            "already_disabled": already_disabled,
+            "failed": failed,
+            "disabled_count": len(disabled),
+            "already_disabled_count": len(already_disabled),
+            "failed_count": len(failed),
+        }
+        self._emit("runtime.patrols.disarmed", result)
+        logger.info(
+            "Patrol disarm completed actor=%s disabled=%d already_disabled=%d failed=%d",
+            actor,
+            len(disabled),
+            len(already_disabled),
+            len(failed),
+        )
+        return result
 
     def reset_circuit_breaker(self, task_name: str) -> bool:
         stats = self._patrol_stats.get(task_name)
@@ -1085,6 +1156,7 @@ class AgentRuntime:
 
         try:
             result = handler(ctx)
+            result = self._resolve_handler_result(result, source="subagent")
             record.status = "completed"
             record.result = result
         except Exception as exc:
@@ -1170,6 +1242,7 @@ class AgentRuntime:
 
         try:
             result = handler(ctx)
+            result = self._resolve_handler_result(result, source="resumed_task")
             del self._checkpoints[task_id]
             return {"ok": True, "result": result, "elapsed_ms": ctx.elapsed_ms()}
         except Exception as exc:

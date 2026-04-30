@@ -138,7 +138,11 @@ class PatrolControlModule(BaseModule):
                 action="system.patrol.enable",
                 name=name,
                 status="succeeded",
-                summary=f"已开启后台任务 {name}",
+                summary=(
+                    f"已开启后台任务 {name}，并立即触发一次执行"
+                    if trigger_now
+                    else f"已开启后台任务 {name}（仅开启自动巡检）"
+                ),
                 trigger_now=trigger_now,
             ),
         }
@@ -171,7 +175,7 @@ class PatrolControlModule(BaseModule):
                 action="system.patrol.disable",
                 name=name,
                 status="succeeded",
-                summary=f"已关闭后台任务 {name}",
+                summary=f"已关闭后台任务 {name}（仅关闭自动巡检，服务进程仍运行）",
             ),
         }
 
@@ -268,7 +272,7 @@ class PatrolControlModule(BaseModule):
                 description=(
                     "Turn ON a patrol. Executes one immediate tick only when "
                     "trigger_now=true. Mutates in-memory ScheduleTask.enabled; "
-                    "no persistence (restart falls back to module initial state). "
+                    "and persists enabled state for restart/reload consistency. "
                     "Does NOT bypass business-layer killswitch env vars — if "
                     "the handler itself is disabled it still returns disabled."
                 ),
@@ -288,6 +292,11 @@ class PatrolControlModule(BaseModule):
                     "用户明确说\"不要长期开着, 只跑这一次\" — 用 trigger "
                     "(trigger 不改 enabled 标志); "
                     "用户要关闭 — 用 disable. "
+                    "用户说\"停服务/重启服务/下线服务\"这类进程生命周期操作 "
+                    "→ 走 runtime 控制面 `/api/runtime/stop`，不是单条 patrol enable。"
+                    "用户明确说\"现在帮我投递 N 个\"这类一次性立即执行命令 "
+                    "→ 必须走业务工具 `job.greet.trigger(confirm_execute=true)`，"
+                    "而不是开启 patrol 生命周期。"
                     "patrol 对应业务有独立 killswitch (如 PULSE_BOSS_AUTOREPLY=off) "
                     "时, enable 只把 patrol 放回调度队列, 不改 killswitch 语义."
                 ),
@@ -355,6 +364,8 @@ class PatrolControlModule(BaseModule):
                 when_not_to_use=(
                     "用户想撤回已发出的动作 — 本工具做不到 (patrol 已点的按钮不可撤); "
                     "全局升级 / 人工接管 — 用 /api/runtime/pause 或 /takeover, 粒度更粗且可恢复; "
+                    "用户说\"停服务\" — 走 `/api/runtime/stop`。disable 只影响该 patrol，"
+                    "不停止 runtime 进程。"
                     "想永久关 — 仍需改 env var 或 module 初始 enabled (见 ADR-004 §6.1 决策 A)."
                 ),
                 parameters_schema=name_schema,

@@ -480,6 +480,36 @@ class TestSafetyPlaneOffBypassesPolicy:
         assert len(connector.reply_calls) == 1
         assert store.created == []
 
+    def test_reply_logged_only_does_not_mark_processed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service, connector, _notifier, _store = _build_service(attach_safety=False)
+
+        def _logged_only(**_: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "status": "logged_only",
+                "error": None,
+                "source": "fake",
+            }
+
+        monkeypatch.setattr(connector, "reply_conversation", _logged_only)
+
+        result = service._execute_reply(
+            conversation_id="conv-dryrun",
+            reply_text="hi",
+            profile_id="default",
+            run_id="run-dryrun",
+            note=None,
+            conversation_hint={},
+        )
+
+        assert result["ok"] is False
+        assert result["status"] == "logged_only"
+        assert connector.mark_calls == [], (
+            "logged_only means no real side effect; mark_processed must be skipped"
+        )
+
 
 # ── _execute_send_resume ask 分支 ──────────────────────────────────────
 
@@ -502,6 +532,36 @@ class TestExecuteSendResumeAsk:
         assert len(connector.mark_calls) == 1
         assert store.created == []
         assert notifier.messages == []
+
+    def test_send_resume_verify_failed_does_not_mark_processed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service, connector, _notifier, _store = _build_service()
+
+        def _verify_failed(**_: Any) -> dict[str, Any]:
+            return {
+                "ok": False,
+                "status": "verify_failed",
+                "error": "resume send effect not observed",
+                "source": "fake",
+            }
+
+        monkeypatch.setattr(connector, "send_resume_attachment", _verify_failed)
+
+        result = service._execute_send_resume(
+            conversation_id="conv-vf",
+            reply_text=None,
+            profile_id="default",
+            run_id="run-vf",
+            note=None,
+            conversation_hint={"hr_name": "HR-X", "hr_id": "hr-x"},
+        )
+
+        assert result["ok"] is False
+        assert result["status"] == "verify_failed"
+        assert connector.mark_calls == [], (
+            "failed delivery must keep conversation unmarked so patrol can retry"
+        )
 
 
 # ── _execute_card ask 分支 ─────────────────────────────────────────────

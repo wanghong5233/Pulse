@@ -208,6 +208,35 @@ def test_patrol_keyword_fans_out_all_memory_target_roles() -> None:
     ) == ["大模型应用开发 Agent 实习", "初创公司 AI 工程实习"]
 
 
+def test_patrol_keyword_appends_intern_when_hard_constraint_is_intern() -> None:
+    service = JobGreetService(
+        connector=object(),  # type: ignore[arg-type]
+        repository=object(),  # type: ignore[arg-type]
+        policy=GreetPolicy(
+            batch_size=3,
+            match_threshold=65,
+            daily_limit=50,
+            default_keyword="AI Agent",
+            greeting_template="",
+            hitl_required=True,
+        ),
+        notifier=object(),  # type: ignore[arg-type]
+        emit_stage_event=lambda **kwargs: str(kwargs.get("trace_id") or "trace-test"),
+    )
+    snapshot = JobMemorySnapshot(
+        workspace_id="job.default",
+        hard_constraints=HardConstraints(
+            target_roles=["大模型应用开发 Agent"],
+            experience_level="intern",
+        ),
+    )
+
+    assert service._resolve_trigger_keywords(  # noqa: SLF001
+        keyword="AI Agent",
+        snapshot=snapshot,
+    ) == ["大模型应用开发 Agent 实习"]
+
+
 def test_trigger_scan_fans_out_target_role_keywords() -> None:
     class _FakeConnector:
         provider_name = "fake_boss"
@@ -216,8 +245,8 @@ def test_trigger_scan_fans_out_target_role_keywords() -> None:
         def __init__(self) -> None:
             self.keywords: list[str] = []
 
-        def scan_jobs(self, *, keyword, max_items, max_pages, job_type, city=None):  # type: ignore[no-untyped-def]
-            _ = max_items, max_pages, job_type, city
+        def scan_jobs(self, *, keyword, **kwargs):  # type: ignore[no-untyped-def]
+            _ = kwargs
             self.keywords.append(str(keyword))
             return {
                 "items": [
@@ -230,6 +259,8 @@ def test_trigger_scan_fans_out_target_role_keywords() -> None:
                 ],
                 "errors": [],
                 "pages_scanned": 1,
+                "scroll_count": 0,
+                "exhausted": True,
                 "source": "fake",
             }
 

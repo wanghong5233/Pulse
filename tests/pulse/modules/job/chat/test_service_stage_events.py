@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from pulse.core.action_report import ACTION_REPORT_KEY
 from pulse.core.notify.notifier import Notification
 from pulse.modules.job._connectors.base import JobPlatformConnector
 from pulse.modules.job.chat.planner import HrMessagePlanner, PlannedChatAction
@@ -551,3 +552,33 @@ def test_manual_required_status_is_not_laundered_into_sent() -> None:
     payload = auto_events[0]["payload"]
     assert payload["status"] == "manual_required"
     assert payload["ok"] is False
+
+
+def test_run_process_returns_action_report_with_manual_chat_link() -> None:
+    rows = [_row(conversation_id="c1", hr_name="A", company="A", latest_message="m1")]
+    rows[0]["conversation_url"] = "https://www.zhipin.com/web/geek/chat?conversationId=abc"
+    scripts = {
+        "m1": PlannedChatAction(
+            action=ChatAction.ESCALATE,
+            reason="需要用户提供实时信息",
+        ),
+    }
+    service, _events, _connector = _build_service(rows=rows, scripts=scripts)
+    result = service.run_process(
+        max_conversations=10,
+        unread_only=True,
+        profile_id="default",
+        notify_on_escalate=True,
+        fetch_latest_hr=True,
+        auto_execute=True,
+        chat_tab="未读",
+        confirm_execute=True,
+    )
+    report = result[ACTION_REPORT_KEY]
+    assert report["action"] == "job.chat"
+    assert report["metrics"]["manual_required"] == 1
+    assert "会话链接" in report["summary"]
+    detail = report["details"][0]
+    assert detail["status"] == "failed"
+    assert detail["url"] == "https://www.zhipin.com/web/geek/chat?conversationId=abc"
+    assert detail["extras"]["manual_required"] is True

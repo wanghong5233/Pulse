@@ -5,7 +5,7 @@
   - ``docs/modules/job/architecture.md`` §6
 
 JobMemory 是业务侧在 ``WorkspaceMemory`` 之上的薄 facade, 内部按
-``workspace_facts`` 的 key 前缀把 ``job.*`` 命名空间分成三类存储:
+``workspace_facts`` 的 key 前缀把 ``job.*`` 命名空间分成四类存储:
 
     [1] Hard Constraints (job.hc.*)
         - 连接器 IO 能直接当 filter 用的字段, 字段集小且稳定
@@ -20,6 +20,11 @@ JobMemory 是业务侧在 ``WorkspaceMemory`` 之上的薄 facade, 内部按
         - 整体替换式的领域文档, 当前唯一实例是简历
         - job.doc:resume         → {raw_text, raw_hash, updated_at}
         - job.doc:resume.parsed  → LLM 解析缓存
+
+    [4] Derived Caches (job.derived.*)
+        - 由领域组件从 LLM 推导出的可复用中间结果, 当前用于 trait→公司集合
+        - key: job.derived.trait_company_set:<sha1(trait_type:trait)>
+        - value: {trait_type, trait, companies, model, updated_at, expires_at}
 
 所有值由 ``WorkspaceMemory`` 统一 JSON 编解码, 本类只处理 Python 对象。
 """
@@ -65,6 +70,9 @@ _KEY_ITEM_PREFIX = "job.item:"
 # Domain Documents (当前仅 resume)
 _KEY_DOC_RESUME = "job.doc:resume"
 _KEY_DOC_RESUME_PARSED = "job.doc:resume.parsed"
+
+# Derived caches
+_KEY_DERIVED_TRAIT_COMPANY_PREFIX = "job.derived.trait_company_set:"
 
 _DEFAULT_SOURCE = "job.memory"
 
@@ -134,6 +142,39 @@ class MemoryItem:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class TraitCompanySet:
+    """LLM 展开的 trait→公司集合缓存。
+
+    ``trait_type`` 目前只允许 ``avoid_trait`` / ``favor_trait``。
+    ``companies`` 是规范化后的公司名列表, 供工具层做字面命中 gate。
+    """
+
+    trait_type: str
+    trait: str
+    companies: list[str]
+    model: str
+    updated_at: str
+    expires_at: str
+
+    @property
+    def is_expired(self) -> bool:
+        expiry = _parse_iso(self.expires_at)
+        if expiry is None:
+            return True
+        return expiry <= datetime.now(timezone.utc)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trait_type": self.trait_type,
+            "trait": self.trait,
+            "companies": list(self.companies),
+            "model": self.model,
+            "updated_at": self.updated_at,
+            "expires_at": self.expires_at,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +314,11 @@ class JobMemorySnapshot:
         """大小写不敏感匹配当前 avoid_company items, 返回 (avoided, reason_or_None)。
 
         替代旧 ``JobMemory.is_company_blocked`` 的语义 — 现在 reason 来自 item.content。
+
+        刻意**只做字面公司名匹配**: 集体名词级偏好 (如 "大厂") 不进这一层,
+        而是在 ``JobSnapshotMatcher`` LLM 阶段由 LLM 用世界知识展开判定.
+        硬编码大厂列表是反 Agent 范式的启发式补丁 — 见 matcher.py 的
+        Verdict policy 注释。
         """
         needle = _normalize(name).casefold()
         if not needle:
@@ -496,6 +542,11 @@ class JobMemory:
             )
         normalized = self._normalize_hc_value(name, value)
         key = f"{_KEY_HC_PREFIX}{name}"
+        if name == "salary_floor_monthly":
+            normalized = self._preserve_salary_spec_storage(
+                key=key,
+                incoming=normalized,
+            )
         self._ws.set_fact(self._workspace_id, key, normalized, source=self._source)
 
     def unset_hard_constraint(self, field_name: str) -> bool:
@@ -649,6 +700,76 @@ class JobMemory:
             out.append(it)
         out.sort(key=lambda it: it.created_at, reverse=True)
         return out
+
+    # ─── Derived caches ──────────────────────────────────────
+
+    def get_trait_company_set(
+        self,
+        *,
+        trait_type: str,
+        trait: str,
+    ) -> TraitCompanySet | None:
+        """读取一个 trait→公司集合缓存。不存在或损坏时返回 ``None``。"""
+        key = self._trait_company_set_key(trait_type=trait_type, trait=trait)
+        raw = self._ws.get_fact(self._workspace_id, key)
+        return self._decode_trait_company_set(raw)
+
+    def set_trait_company_set(
+        self,
+        *,
+        trait_type: str,
+        trait: str,
+        companies: list[str],
+        model: str,
+        updated_at: str,
+        expires_at: str,
+    ) -> TraitCompanySet:
+        """写入 trait→公司集合缓存 (upsert)。"""
+        clean_trait_type = _normalize(trait_type)
+        if clean_trait_type not in ("avoid_trait", "favor_trait"):
+            raise ValueError(
+                f"trait_type must be avoid_trait|favor_trait, got {trait_type!r}"
+            )
+        clean_trait = _normalize(trait)
+        if not clean_trait:
+            raise ValueError("trait must be non-empty")
+        clean_model = _normalize(model) or "unknown"
+        clean_updated_at = _normalize(updated_at)
+        clean_expires_at = _normalize(expires_at)
+        if not clean_updated_at:
+            raise ValueError("updated_at must be non-empty ISO string")
+        if not clean_expires_at:
+            raise ValueError("expires_at must be non-empty ISO string")
+        # 只做字面去重, 不做 alias/语义归并; 语义展开是 LLM 的职责。
+        seen: set[str] = set()
+        normalized_companies: list[str] = []
+        for name in companies:
+            text = _normalize(name)
+            if not text:
+                continue
+            key = text.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized_companies.append(text)
+        record = TraitCompanySet(
+            trait_type=clean_trait_type,
+            trait=clean_trait,
+            companies=normalized_companies,
+            model=clean_model,
+            updated_at=clean_updated_at,
+            expires_at=clean_expires_at,
+        )
+        key = self._trait_company_set_key(
+            trait_type=clean_trait_type, trait=clean_trait,
+        )
+        self._ws.set_fact(
+            self._workspace_id,
+            key,
+            record.to_dict(),
+            source=self._source,
+        )
+        return record
 
     # ─── Resume (Domain Document) ─────────────────────────────
 
@@ -863,6 +984,29 @@ class JobMemory:
             return _normalize(value)
         return value
 
+    def _preserve_salary_spec_storage(self, *, key: str, incoming: Any) -> Any:
+        """避免把结构化薪资 spec 意外降级成裸整数。
+
+        场景:
+          - pre-turn dispatcher 已写入 ``{"value_monthly_k": 7, "source": 300元/天}``
+          - 同一轮里 planner 又发 ``job.hard_constraint.set(value=7)``
+
+        语义上两者等价, 但后者会丢失 source, 触发后续审计/回复漂移。
+        策略: 仅当 ``incoming`` 为裸 int 且与现存 structured monthly_k 完全相等
+        时, 复用现存 structured 记录; 其他情况照常覆盖。
+        """
+        if not isinstance(incoming, int) or isinstance(incoming, bool):
+            return incoming
+        existing_raw = self._ws.get_fact(self._workspace_id, key)
+        if not isinstance(existing_raw, dict):
+            return incoming
+        existing_k, existing_spec = self._decode_salary_storage(existing_raw)
+        if existing_k is None or existing_spec is None:
+            return incoming
+        if incoming != existing_k:
+            return incoming
+        return existing_raw
+
     @classmethod
     def _normalize_salary_floor_value(cls, value: Any) -> Any:
         """把 salary_floor_monthly 的输入归一化为存储形态。
@@ -987,6 +1131,44 @@ class JobMemory:
             return mk, src
         return cls._as_int_or_none(raw), None
 
+    @staticmethod
+    def _trait_company_set_key(*, trait_type: str, trait: str) -> str:
+        clean_type = _normalize(trait_type)
+        clean_trait = _normalize(trait).casefold()
+        digest = hashlib.sha1(
+            f"{clean_type}:{clean_trait}".encode("utf-8")
+        ).hexdigest()
+        return f"{_KEY_DERIVED_TRAIT_COMPANY_PREFIX}{digest}"
+
+    @staticmethod
+    def _decode_trait_company_set(value: Any) -> TraitCompanySet | None:
+        if not isinstance(value, dict):
+            return None
+        trait_type = _normalize(value.get("trait_type"))
+        trait = _normalize(value.get("trait"))
+        updated_at = _normalize(value.get("updated_at"))
+        expires_at = _normalize(value.get("expires_at"))
+        if trait_type not in ("avoid_trait", "favor_trait"):
+            return None
+        if not trait or not updated_at or not expires_at:
+            return None
+        companies_raw = value.get("companies")
+        if not isinstance(companies_raw, list):
+            return None
+        companies = []
+        for item in companies_raw:
+            text = _normalize(item)
+            if text:
+                companies.append(text)
+        return TraitCompanySet(
+            trait_type=trait_type,
+            trait=trait,
+            companies=companies,
+            model=_normalize(value.get("model")) or "unknown",
+            updated_at=updated_at,
+            expires_at=expires_at,
+        )
+
     def _normalize_item_for_write(
         self, item: dict[str, Any] | MemoryItem
     ) -> MemoryItem:
@@ -1098,6 +1280,7 @@ __all__ = [
     "JobMemory",
     "JobMemorySnapshot",
     "MemoryItem",
+    "TraitCompanySet",
     "HardConstraints",
     "JobResume",
     "ResumeParsed",

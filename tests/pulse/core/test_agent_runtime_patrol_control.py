@@ -17,6 +17,9 @@ a shadow test.  Exercising the real pipeline covers:
 """
 from __future__ import annotations
 
+import asyncio
+from typing import Any
+
 import pytest
 
 from pulse.core.runtime import AgentRuntime, PatrolOutcome, RuntimeConfig
@@ -126,6 +129,22 @@ def test_enable_disable_unknown_patrol_return_false_and_emit_no_event(runtime) -
     assert not any(t.startswith("runtime.patrol.lifecycle.") for t in sink.types())
 
 
+def test_disarm_patrols_disables_all_enabled_without_running_handlers(runtime) -> None:
+    rt, sink = runtime
+    enabled_calls = _register_noop_patrol(rt, "alpha", enabled=True)
+    _register_noop_patrol(rt, "beta", enabled=False)
+
+    out = rt.disarm_patrols(actor="test")
+
+    assert out["disabled"] == ["alpha"]
+    assert out["already_disabled"] == ["beta"]
+    assert out["failed"] == []
+    assert rt.get_patrol_stats("alpha")["enabled"] is False
+    assert rt.get_patrol_stats("beta")["enabled"] is False
+    assert enabled_calls == [], "disarm is lifecycle-only, must not execute business handler"
+    assert "runtime.patrols.disarmed" in sink.types()
+
+
 def test_heartbeat_task_is_not_controllable(runtime) -> None:
     """ADR-004 §6.1.7 invariant #1: the internal heartbeat must not be
     reachable through list/get/enable/disable/trigger — prevents runtime
@@ -166,6 +185,31 @@ def test_run_patrol_once_invokes_handler_and_records_stats(runtime) -> None:
     assert "runtime.patrol.lifecycle.triggered" in sink.types()
     assert "runtime.patrol.started" in sink.types()
     assert "runtime.patrol.completed" in sink.types()
+
+
+def test_run_patrol_once_supports_async_handler(runtime) -> None:
+    rt, _ = runtime
+    calls: list[str] = []
+
+    async def _async_handler(ctx) -> dict[str, Any]:
+        await asyncio.sleep(0)
+        calls.append(ctx.task_id)
+        return {"ok": True}
+
+    rt.register_patrol(
+        name="alpha_async",
+        handler=_async_handler,
+        peak_interval=60,
+        offpeak_interval=120,
+        enabled=True,
+        active_hours_only=False,
+        token_budget=1000,
+    )
+
+    result = rt.run_patrol_once("alpha_async")
+    assert result["ok"] is True
+    assert result["last_outcome"] == PatrolOutcome.completed.value
+    assert len(calls) == 1
 
 
 def test_run_patrol_once_propagates_handler_failure_into_stats(runtime) -> None:

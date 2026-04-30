@@ -221,6 +221,68 @@ def test_runtime_health_includes_browser_config(monkeypatch) -> None:
     assert health["browser"]["block_iframe_core"] is False
 
 
+def test_runtime_health_includes_browser_idle_runtime_fields(monkeypatch) -> None:
+    monkeypatch.setenv("PULSE_BOSS_BROWSER_IDLE_CLOSE_SEC", "600")
+    health = runtime.health()
+    assert int(health["browser"]["idle_close_sec"]) == 600
+    assert "idle_elapsed_sec" in health["browser"]
+    assert "runtime_open" in health["browser"]
+
+
+def test_runtime_should_recycle_browser_for_idle(monkeypatch) -> None:
+    monkeypatch.setenv("PULSE_BOSS_BROWSER_IDLE_CLOSE_SEC", "10")
+    monkeypatch.setattr(runtime, "_PAGE", object(), raising=False)
+    monkeypatch.setattr(runtime, "_BROWSER_LAST_USED_MONO", 1.0, raising=False)
+    assert runtime._should_recycle_browser_for_idle(now_mono=12.5) is True
+    assert runtime._should_recycle_browser_for_idle(now_mono=9.0) is False
+
+
+def test_runtime_reset_browser_session_closes_handles(monkeypatch) -> None:
+    class _FakePage:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _FakeContext:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _FakeManager:
+        def __init__(self) -> None:
+            self.stopped = False
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    page = _FakePage()
+    context = _FakeContext()
+    manager = _FakeManager()
+    monkeypatch.setattr(runtime, "_PAGE", page, raising=False)
+    monkeypatch.setattr(runtime, "_CONTEXT", context, raising=False)
+    monkeypatch.setattr(runtime, "_PLAYWRIGHT", object(), raising=False)
+    monkeypatch.setattr(runtime, "_PLAYWRIGHT_MANAGER", manager, raising=False)
+    monkeypatch.setattr(runtime, "_BROWSER_LAST_USED_MONO", 123.0, raising=False)
+
+    result = runtime.reset_browser_session(reason="unit_test")
+    assert result["ok"] is True
+    assert result["closed_page"] is True
+    assert result["closed_context"] is True
+    assert result["closed_playwright"] is True
+    assert runtime._PAGE is None
+    assert runtime._CONTEXT is None
+    assert runtime._PLAYWRIGHT is None
+    assert runtime._PLAYWRIGHT_MANAGER is None
+    assert float(runtime._BROWSER_LAST_USED_MONO) == 0.0
+
+
 def test_runtime_uses_patchright_not_playwright() -> None:
     """Regression guard: BOSS 反爬在 CDP 层检测, 必须用 patchright 而非原生 playwright.
 

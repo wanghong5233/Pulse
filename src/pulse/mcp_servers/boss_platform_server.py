@@ -23,23 +23,36 @@ def check_login(check_url: str = "") -> dict:
 
 
 @_MCP.tool
+def reset_browser_session(reason: str = "manual") -> dict:
+    """Close browser session; next call recreates it."""
+    return runtime.reset_browser_session(reason=reason)
+
+
+@_MCP.tool
 def scan_jobs(
     keyword: str,
-    max_items: int = 10,
-    max_pages: int = 2,
+    target_count: int = 10,
+    evaluation_cap: int = 60,
+    scroll_plateau_rounds: int = 3,
+    max_items: int = 0,
+    max_pages: int = 0,
     job_type: str = "all",
     city: str = "",
 ) -> dict:
-    """Scan jobs from configured BOSS sources.
+    """Streaming scan via sidebar scroll until target/cap/plateau hit.
 
-    ``city`` is an optional human-readable city name (e.g. ``杭州`` / ``上海``);
-    when provided and recognized in the BOSS city-code table, the browser
-    scan scopes to that city. Empty string = nationwide scan.
+    ``target_count`` = early-stop threshold; ``evaluation_cap`` = hard
+    ceiling; ``scroll_plateau_rounds`` = scroll-empty streak that declares
+    sidebar exhausted. ``max_items`` / ``max_pages`` are deprecated aliases
+    kept for backward-compat with older callers; pass 0 to ignore them.
     """
     return runtime.scan_jobs(
         keyword=keyword,
-        max_items=max_items,
-        max_pages=max_pages,
+        target_count=target_count if target_count > 0 else None,
+        evaluation_cap=evaluation_cap if evaluation_cap > 0 else None,
+        scroll_plateau_rounds=scroll_plateau_rounds if scroll_plateau_rounds > 0 else None,
+        max_items=max_items if max_items > 0 else None,
+        max_pages=max_pages if max_pages > 0 else None,
         job_type=job_type,
         city=(city or None),
     )

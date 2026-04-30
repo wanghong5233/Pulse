@@ -21,6 +21,15 @@ from pulse.core.storage.engine import DatabaseEngine
 logger = logging.getLogger(__name__)
 
 
+def _normalize_http_url(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not (text.startswith("http://") or text.startswith("https://")):
+        return ""
+    return text[:600]
+
+
 @dataclass(frozen=True, slots=True)
 class IngestOutcome:
     inserted: int
@@ -136,6 +145,9 @@ class ChatRepository:
         if not conversation_id:
             seed = f"{company}-{job_title}-{hr_name}"
             conversation_id = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+        conversation_url = _normalize_http_url(
+            row.get("conversation_url") or row.get("chat_url") or row.get("url")
+        )
         latest_time = str(row.get("latest_time") or row.get("latest_hr_time") or "刚刚")
         unread_count = max(0, min(int(row.get("unread_count") or 0), 99))
         cards_raw = row.get("cards")
@@ -157,6 +169,7 @@ class ChatRepository:
                     )
         return {
             "conversation_id": conversation_id,
+            "conversation_url": conversation_url,
             "hr_name": hr_name,
             "company": company,
             "job_title": job_title,

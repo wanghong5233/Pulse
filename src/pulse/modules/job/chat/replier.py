@@ -7,6 +7,7 @@ Pure policy component. Given:
                      (provides hr_name / company / job_title / history / cards)
   * ``snapshot``    — current :class:`JobMemorySnapshot` (blocked / prefs / user facts)
   * ``tone_hint``   — optional override, one of ``professional / friendly / concise``
+  * ``persona_hint``— optional persona style label (e.g. ``INTJ``)
 
 Returns :class:`ReplyDraft` with ``reply_text``, ``tone``, ``confidence`` and
 ``needs_hitl``. ``confidence`` is a 0.0-1.0 score the service uses to decide
@@ -47,6 +48,7 @@ logger = logging.getLogger(__name__)
 _TONES: frozenset[str] = frozenset({"professional", "friendly", "concise"})
 _REPLY_MAX_CHARS = 180
 _HISTORY_MAX_TURNS = 6
+_DEFAULT_PERSONA_HINT = "INTJ"
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +88,7 @@ class HrReplyGenerator:
         conversation: dict[str, Any] | None = None,
         snapshot: JobMemorySnapshot | None = None,
         tone_hint: str = "",
+        persona_hint: str = "",
         max_chars: int = _REPLY_MAX_CHARS,
     ) -> ReplyDraft:
         safe_message = str(hr_message or "").strip()
@@ -101,6 +104,7 @@ class HrReplyGenerator:
             conversation=conversation or {},
             snapshot=snapshot,
             tone_hint=tone_hint,
+            persona_hint=persona_hint,
             max_chars=limit,
         )
         if llm_draft is not None:
@@ -120,12 +124,14 @@ class HrReplyGenerator:
         conversation: dict[str, Any],
         snapshot: JobMemorySnapshot | None,
         tone_hint: str,
+        persona_hint: str,
         max_chars: int,
     ) -> ReplyDraft | None:
         snapshot_md = snapshot.to_prompt_section() if snapshot is not None else "(no preferences set)"
         context_md = self._render_conversation(conversation)
         tone = (tone_hint or "").strip().lower()
         tone_md = tone if tone in _TONES else "professional"
+        persona_md = str(persona_hint or "").strip()[:40] or _DEFAULT_PERSONA_HINT
 
         # Why this prompt is policy-free: LLM 被教成"不承诺时间 / 不示好屏蔽
         # 公司"会被新样本绕过且无审计痕迹. SafetyPlane 在 tool-use 前用
@@ -136,6 +142,8 @@ class HrReplyGenerator:
             "preferences block below; DO NOT try to enforce safety / authorization "
             "rules yourself — that decision is made downstream.\n"
             f"约束: reply_text ≤ {max_chars} 汉字, 语气 {tone_md}, 一段话不换行.\n"
+            f"人格与表达约束: 采用 {persona_md} 风格。默认按 INTJ 的理性、直接、"
+            "结构化表达；避免夸张、情绪化和过度寒暄，同时保持职场礼仪与尊重语气。\n"
             "Respond with ONLY a JSON object. Schema:\n"
             '{"reply_text":"<中文>",'
             '"tone":"professional|friendly|concise",'

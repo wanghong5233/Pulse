@@ -98,8 +98,10 @@ from ..shared.models import JobGreetTriggerRequest, JobScanRunRequest
 from ..memory import JobMemory
 from .greeter import JobGreeter
 from .matcher import JobSnapshotMatcher
+from .reflection import ReflectionPlanner
 from .repository import GreetRepository
 from .service import GreetPolicy, JobGreetService
+from .trait_expander import TraitCompanyExpander
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +163,11 @@ class JobGreetModule(BaseModule):
         llm_router = LLMRouter()
         matcher = JobSnapshotMatcher(llm_router)
         greeter = JobGreeter(llm_router)
+        trait_expander = TraitCompanyExpander(
+            llm_router,
+            preferences=preferences,
+        )
+        reflection_planner = ReflectionPlanner(llm_router)
         return JobGreetService(
             connector=connector,
             repository=repository,
@@ -170,6 +177,8 @@ class JobGreetModule(BaseModule):
             preferences=preferences,
             matcher=matcher,
             greeter=greeter,
+            trait_expander=trait_expander,
+            reflection_planner=reflection_planner,
         )
 
     # ------------------------------------------------------------------ AgentRuntime
@@ -312,7 +321,9 @@ class JobGreetModule(BaseModule):
                 extract_facts=_extract_facts_scan,
                 description=(
                     "Read-only: scan recruiting platform job listings by keyword. "
-                    "Does NOT send any greetings. Results are pre-filtered by the user's "
+                    "Does NOT send any greetings. Does NOT run the trigger-only "
+                    "ReflectionPlanner loop (keyword evolve + extra scan rounds live in "
+                    "`job.greet.trigger`). Results are pre-filtered by the user's "
                     "stored hard constraints (preferred_location / salary_floor_monthly / "
                     "experience_level), avoid lists, and past-greeted URLs. "
                     "Returns a `scan_handle` token — pass it to the next `job.greet.trigger` "
@@ -329,9 +340,12 @@ class JobGreetModule(BaseModule):
                 ),
                 when_not_to_use=(
                     "职责划分: 1) 需要**真实发送**打招呼 → `job.greet.trigger`; "
-                    "2) 修改/新增求职偏好 → `job.memory.record` / `job.hard_constraint.set`; "
-                    "3) 读 HR 对话 → `job.chat.pull`; "
-                    "4) 连接器未 ready 时返回 items=[], 不得据此编造岗位列表。"
+                    "2) 同一轮用户话语含「帮我投递/投递 N 个/打招呼/联系 HR」等**即时执行**意图时, "
+                    "**禁止**仅以本工具结束本轮; 应先 `job.greet.scan` (可选) 再用 "
+                    "`job.greet.trigger` 完成匹配与 (按语义) `confirm_execute`; "
+                    "3) 修改/新增求职偏好 → `job.memory.record` / `job.hard_constraint.set`; "
+                    "4) 读 HR 对话 → `job.chat.pull`; "
+                    "5) 连接器未 ready 时返回 items=[], 不得据此编造岗位列表。"
                 ),
                 parameters_schema={
                     "type": "object",
@@ -400,6 +414,8 @@ class JobGreetModule(BaseModule):
                 extract_facts=_extract_facts_trigger,
                 description=(
                     "MUTATING: send real greetings to top matches on the recruiting platform. "
+                    "Hosts the scan → filter → LLM match → optional ReflectionPlanner keyword "
+                    "evolution (bounded extra scan rounds) pipeline. "
                     "Reuses the scan_handle from a previous job.greet.scan (preferred) or runs "
                     "its own scan when no handle is supplied. Respects daily_limit, blocked "
                     "companies/keywords, and the confirm_execute preview/execution switch."

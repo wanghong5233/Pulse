@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import inspect
 import io
@@ -12,6 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
@@ -167,6 +169,271 @@ def _build_all_mcp_transports(
                     name=cfg.name, built=False, url=cfg.url, error=str(exc)[:120],
                 ))
     return transports
+
+
+def _synthesize_reply_from_brain_result(brain_result: Any) -> str:
+    """Best-effort reply fallback when Brain answer is empty.
+
+    Contract:
+      - If tool steps carry ActionReport, prefer its summary (ground truth).
+      - Else if tools were used, return a minimal execution receipt.
+      - Never fabricate business facts.
+    """
+    steps = list(getattr(brain_result, "steps", []) or [])
+    for step in reversed(steps):
+        report = getattr(step, "action_report", None)
+        if not isinstance(report, dict):
+            continue
+        summary = str(report.get("summary") or "").strip()
+        metrics = report.get("metrics")
+        metric_parts: list[str] = []
+        if isinstance(metrics, dict):
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    metric_parts.append(f"{str(key)}={value}")
+        if summary:
+            if metric_parts:
+                return f"{summary}（{', '.join(metric_parts[:3])}）"
+            return summary
+        action = str(report.get("action") or getattr(step, "tool_name", "") or "").strip()
+        status = str(report.get("status") or "").strip() or "unknown"
+        if action:
+            return f"已执行 {action}，状态：{status}。"
+    used_tools = [str(x).strip() for x in (getattr(brain_result, "used_tools", []) or []) if str(x).strip()]
+    if used_tools:
+        head = "、".join(used_tools[:3])
+        if len(used_tools) > 3:
+            head = f"{head} 等"
+        return f"已完成本轮请求（调用工具：{head}）。"
+    return ""
+
+
+def _extract_action_report_urls(
+    brain_result: Any,
+    *,
+    action: str,
+) -> list[str]:
+    """Collect detail URLs from the latest matching ActionReport."""
+    steps = list(getattr(brain_result, "steps", []) or [])
+    safe_action = str(action or "").strip()
+    if not safe_action:
+        return []
+    for step in reversed(steps):
+        report = getattr(step, "action_report", None)
+        if not isinstance(report, dict):
+            continue
+        if str(report.get("action") or "").strip() != safe_action:
+            continue
+        details = report.get("details")
+        if not isinstance(details, list):
+            return []
+        urls: list[str] = []
+        seen: set[str] = set()
+        for item in details:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            if not (url.startswith("http://") or url.startswith("https://")):
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+        return urls
+    return []
+
+
+def _render_clickable_job_link(url: str) -> str:
+    """Render markdown link with readable label for IM clients."""
+    safe_url = str(url or "").strip()
+    if not safe_url:
+        return ""
+    # Avoid breaking markdown when URL contains ')' characters.
+    safe_url = safe_url.replace(")", "%29")
+    return f"[查看职位]({safe_url})"
+
+
+def _render_clickable_chat_link(url: str) -> str:
+    safe_url = str(url or "").strip()
+    if not safe_url:
+        return ""
+    safe_url = safe_url.replace(")", "%29")
+    return f"[查看会话]({safe_url})"
+
+
+def _patch_job_greet_detail_links(reply: str, brain_result: Any) -> str:
+    """Patch detail placeholders/raw URLs into clickable markdown links."""
+    text = str(reply or "").strip()
+    if not text:
+        return text
+    urls = _extract_action_report_urls(brain_result, action="job.greet")
+    if not urls:
+        return text
+    placeholder = "查看详情"
+    patched = text
+    used_urls: list[str] = []
+
+    while placeholder in patched and len(used_urls) < len(urls):
+        next_url = urls[len(used_urls)]
+        patched = patched.replace(placeholder, _render_clickable_job_link(next_url), 1)
+        used_urls.append(next_url)
+
+    for url in urls:
+        if url in used_urls:
+            continue
+        if f"]({url})" in patched:
+            used_urls.append(url)
+            continue
+        if url in patched:
+            patched = patched.replace(url, _render_clickable_job_link(url), 1)
+            used_urls.append(url)
+
+    if len(used_urls) >= len(urls):
+        return patched
+    remaining = [url for url in urls if url not in used_urls]
+    lines = [f"{idx}. {_render_clickable_job_link(url)}" for idx, url in enumerate(remaining, start=1)]
+    return patched.rstrip() + "\n\n岗位详情链接：\n" + "\n".join(lines)
+
+
+def _safe_job_chat_title(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return " ".join(text.split())[:240]
+
+
+def _with_conversation_id(url: str, conversation_id: str) -> str:
+    safe_url = str(url or "").strip()
+    safe_id = str(conversation_id or "").strip()[:120]
+    if not safe_id:
+        return safe_url
+    if not safe_url:
+        return f"https://www.zhipin.com/web/geek/chat?conversationId={safe_id}"
+    try:
+        parsed = urlparse(safe_url)
+    except ValueError:
+        return safe_url
+    if not parsed.scheme or not parsed.netloc:
+        return safe_url
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    existing = [str(v or "").strip() for v in query.get("conversationId") or []]
+    if any(existing):
+        return safe_url
+    query["conversationId"] = [safe_id]
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+
+def _extract_job_chat_manual_entries(brain_result: Any) -> list[dict[str, str]]:
+    steps = list(getattr(brain_result, "steps", []) or [])
+    for step in reversed(steps):
+        report = getattr(step, "action_report", None)
+        if not isinstance(report, dict):
+            continue
+        if str(report.get("action") or "").strip() != "job.chat":
+            continue
+        details = report.get("details")
+        if not isinstance(details, list):
+            return []
+        manual_entries: list[dict[str, str]] = []
+        fallback_entries: list[dict[str, str]] = []
+        seen_keys: set[str] = set()
+        for item in details:
+            if not isinstance(item, dict):
+                continue
+            extras = item.get("extras")
+            extras_map = extras if isinstance(extras, dict) else {}
+            conversation_id = str(
+                extras_map.get("conversation_id") or ""
+            ).strip()[:120]
+            target = _safe_job_chat_title(
+                item.get("target")
+                or extras_map.get("conversation_title")
+                or f"conversation:{conversation_id or '-'}"
+            )
+            card_title = _safe_job_chat_title(extras_map.get("card_title"))
+            title = target
+            if card_title and card_title not in title:
+                title = f"{title} | 卡片: {card_title}"
+            raw_url = str(item.get("url") or "").strip()
+            if raw_url and not (
+                raw_url.startswith("http://") or raw_url.startswith("https://")
+            ):
+                raw_url = ""
+            resolved_url = _with_conversation_id(raw_url, conversation_id)
+            key = f"{resolved_url}|{conversation_id}|{title}"
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            entry = {
+                "url": resolved_url,
+                "conversation_id": conversation_id,
+                "title": title,
+            }
+            fallback_entries.append(entry)
+            status = str(item.get("status") or "").strip().lower()
+            manual_flag = False
+            if isinstance(extras_map, dict):
+                extra_value = extras_map.get("manual_required")
+                if isinstance(extra_value, bool):
+                    manual_flag = extra_value
+                elif isinstance(extra_value, (int, float)):
+                    manual_flag = extra_value != 0
+                elif isinstance(extra_value, str):
+                    manual_flag = extra_value.strip().lower() in {"1", "true", "yes", "y"}
+            if manual_flag or status == "failed":
+                manual_entries.append(entry)
+        return manual_entries or fallback_entries
+    return []
+
+
+def _extract_job_chat_manual_urls(brain_result: Any) -> list[str]:
+    return [
+        entry["url"]
+        for entry in _extract_job_chat_manual_entries(brain_result)
+        if str(entry.get("url") or "").strip()
+    ]
+
+
+def _patch_job_chat_manual_links(reply: str, brain_result: Any) -> str:
+    text = str(reply or "").strip()
+    entries = _extract_job_chat_manual_entries(brain_result)
+    if not entries:
+        return text
+    patched = text
+    used_urls: set[str] = set()
+    for entry in entries:
+        url = str(entry.get("url") or "").strip()
+        if not url:
+            continue
+        if f"]({url})" in patched:
+            used_urls.add(url)
+            continue
+        if url in patched:
+            patched = patched.replace(url, _render_clickable_chat_link(url), 1)
+            used_urls.add(url)
+    if all((not str(entry.get("url") or "").strip()) or (str(entry.get("url") or "").strip() in used_urls) for entry in entries):
+        return patched
+    remaining = [
+        entry
+        for entry in entries
+        if (not str(entry.get("url") or "").strip())
+        or (str(entry.get("url") or "").strip() not in used_urls)
+    ]
+    lines: list[str] = []
+    for idx, entry in enumerate(remaining, start=1):
+        title = _safe_job_chat_title(entry.get("title")) or "未命名会话"
+        conversation_id = str(entry.get("conversation_id") or "").strip()
+        if conversation_id and conversation_id not in title:
+            title = f"{title}（会话ID: {conversation_id}）"
+        url = str(entry.get("url") or "").strip()
+        if url:
+            lines.append(f"{idx}. {title}：{_render_clickable_chat_link(url)}")
+        else:
+            lines.append(f"{idx}. {title}")
+    prefix = (patched.rstrip() + "\n\n") if patched else ""
+    return prefix + "待你人工处理的会话链接：\n" + "\n".join(lines)
 
 
 def create_app(
@@ -1203,7 +1470,22 @@ def create_app(
 
         response["handled"] = bool(brain_result.answer or brain_result.used_tools)
         response["mode"] = "brain"
-        response["reply"] = brain_result.answer
+        answer_text = str(brain_result.answer or "").strip()
+        if not answer_text and list(brain_result.used_tools):
+            answer_text = _synthesize_reply_from_brain_result(brain_result)
+            if answer_text:
+                _emit_event(
+                    "channel.reply.synthesized",
+                    {
+                        "trace_id": trace_id,
+                        "channel": message.channel,
+                        "reason": "empty_brain_answer_with_used_tools",
+                        "used_tools": list(brain_result.used_tools),
+                    },
+                )
+        answer_text = _patch_job_greet_detail_links(answer_text, brain_result)
+        answer_text = _patch_job_chat_manual_links(answer_text, brain_result)
+        response["reply"] = answer_text
         response["brain"] = brain_result.to_dict()
         if module_result is not None:
             response["result"] = module_result
@@ -1332,6 +1614,15 @@ def create_app(
         finally:
             if wechat_bot.configured:
                 await wechat_bot.stop()
+            try:
+                disarm_result = agent_runtime.disarm_patrols(actor="lifespan:shutdown")
+                if int(disarm_result.get("failed_count") or 0) > 0:
+                    logger.warning(
+                        "runtime shutdown disarm has failures failed=%s",
+                        disarm_result.get("failed"),
+                    )
+            except OSError as exc:
+                logger.warning("runtime shutdown disarm failed: %s", exc)
             agent_runtime.stop()
             for module in reversed(module_registry.modules):
                 shutdown_result = module.on_shutdown()
@@ -1615,9 +1906,24 @@ def create_app(
         return {"ok": started, "result": agent_runtime.status()}
 
     @app.post("/api/runtime/stop")
-    async def runtime_stop() -> dict[str, Any]:
+    async def runtime_stop(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        body = dict(payload or {})
+        # Safety-default: manual stop disarms patrol lifecycle unless caller
+        # explicitly opts out (disarm_patrols=false).
+        disarm_patrols = bool(body.get("disarm_patrols", True))
+        disarm_result: dict[str, Any] | None = None
+        if disarm_patrols:
+            disarm_result = agent_runtime.disarm_patrols(actor="rest:runtime_stop")
         stopped = agent_runtime.stop()
-        return {"ok": stopped, "result": agent_runtime.status()}
+        return {
+            "ok": True,
+            "result": {
+                "stopped": bool(stopped),
+                "disarm_patrols": disarm_patrols,
+                "disarm": disarm_result,
+                "status": agent_runtime.status(),
+            },
+        }
 
     @app.post("/api/runtime/trigger")
     async def runtime_trigger() -> dict[str, Any]:
@@ -1631,12 +1937,12 @@ def create_app(
 
     @app.post("/api/runtime/wake")
     async def runtime_wake() -> dict[str, Any]:
-        result = agent_runtime.manual_wake()
+        result = await asyncio.to_thread(agent_runtime.manual_wake)
         return {"ok": True, "result": result}
 
     @app.get("/api/runtime/heartbeat")
     async def runtime_heartbeat() -> dict[str, Any]:
-        result = agent_runtime.heartbeat()
+        result = await asyncio.to_thread(agent_runtime.heartbeat)
         return {"ok": True, "result": result}
 
     @app.post("/api/runtime/takeover")
@@ -1697,7 +2003,7 @@ def create_app(
 
     @app.post("/api/runtime/patrols/{name}/trigger")
     async def runtime_patrol_trigger(name: str) -> dict[str, Any]:
-        result = agent_runtime.run_patrol_once(name)
+        result = await asyncio.to_thread(agent_runtime.run_patrol_once, name)
         return {"ok": bool(result.get("ok")), "result": result}
 
     @app.get("/api/runtime/subagents")

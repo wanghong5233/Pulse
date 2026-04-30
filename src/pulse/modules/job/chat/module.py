@@ -225,10 +225,11 @@ class JobChatModule(BaseModule):
         """细粒度 intent 工具, 供 Brain tool_use 直接调用。
 
         - ``job.chat.pull``: 只读,拉未读对话预览;
+        - ``job.chat.process_once``: 一次性真实处理未读(执行语义与 patrol 一致);
         - ``job.chat.process``: 分类 + 可选自动回复/发送简历, 触达真实 BOSS 动作时
           依赖 ``ChatPolicy.auto_execute`` + ``confirm_execute`` + HITL 门控。
 
-        两个 intent 本身都不写 memory (``mutates=False``); ``process`` 因为可能
+        三个 intent 本身都不写 memory (``mutates=False``); ``process*`` 因为可能
         产生对外副作用标记为 ``risk_level=2`` + ``requires_confirmation=True``。
 
         见 ``docs/Pulse-DomainMemory与Tool模式.md`` §4.3 / §7.3 M1。
@@ -255,6 +256,19 @@ class JobChatModule(BaseModule):
                 auto_execute=bool(kwargs.get("auto_execute") or False),
                 chat_tab=str(kwargs.get("chat_tab") or "未读"),
                 confirm_execute=bool(kwargs.get("confirm_execute") or False),
+            )
+
+        def _process_once_handler(**kwargs: Any) -> dict[str, Any]:
+            profile_id = kwargs.get("profile_id")
+            return s.run_process(
+                max_conversations=int(kwargs.get("max_conversations") or 20),
+                unread_only=bool(kwargs.get("unread_only", True)),
+                profile_id=str(profile_id) if profile_id else default_profile_id,
+                notify_on_escalate=bool(kwargs.get("notify_on_escalate", True)),
+                fetch_latest_hr=bool(kwargs.get("fetch_latest_hr", True)),
+                auto_execute=True,
+                chat_tab=str(kwargs.get("chat_tab") or "未读"),
+                confirm_execute=True,
             )
 
         return [
@@ -317,6 +331,70 @@ class JobChatModule(BaseModule):
                 ],
             ),
             IntentSpec(
+                name="job.chat.process_once",
+                description=(
+                    "One-shot real processing of unread HR messages. Executes replies/resume/card "
+                    "immediately with the same semantics as patrol."
+                ),
+                when_to_use=(
+                    "用户明确要求\"现在就处理一次未读 HR 消息\"时使用。"
+                    "此工具固定真实执行: auto_execute=true + confirm_execute=true。"
+                    "用于交互式单次处理, 与 `job_chat.patrol` 的执行语义一致。"
+                ),
+                when_not_to_use=(
+                    "职责划分: 1) 只看不回 → `job.chat.pull`; "
+                    "2) 需要预览计划而不是立刻执行 → `job.chat.process(auto_execute=false)`; "
+                    "3) 开启后台持续监听而不是单次执行 → "
+                    "`system.patrol.enable(name=\"job_chat.patrol\", trigger_now=false)`。"
+                ),
+                parameters_schema={
+                    "type": "object",
+                    "properties": {
+                        "max_conversations": {
+                            "type": "integer",
+                            "description": "Max unread conversations to handle once.",
+                            "default": 20,
+                            "minimum": 1,
+                            "maximum": 50,
+                        },
+                        "unread_only": {
+                            "type": "boolean",
+                            "default": True,
+                        },
+                        "profile_id": {
+                            "type": "string",
+                            "description": (
+                                "Resume profile id used for send-resume actions. "
+                                f"Omit to use default '{default_profile_id}'."
+                            ),
+                        },
+                        "notify_on_escalate": {
+                            "type": "boolean",
+                            "default": True,
+                        },
+                        "fetch_latest_hr": {
+                            "type": "boolean",
+                            "default": True,
+                        },
+                        "chat_tab": {
+                            "type": "string",
+                            "default": "未读",
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+                handler=_process_once_handler,
+                mutates=False,
+                requires_confirmation=True,
+                risk_level=2,
+                examples=[
+                    {
+                        "user_utterance": "现在就帮我处理一次未读 HR 消息",
+                        "kwargs": {"max_conversations": 20, "chat_tab": "未读"},
+                    },
+                ],
+            ),
+            IntentSpec(
                 name="job.chat.process",
                 description=(
                     "Classify unread HR messages and (optionally) reply / send resume. "
@@ -337,6 +415,7 @@ class JobChatModule(BaseModule):
                     "4) 用户表达\"开启 / 启动 / 打开 / 托管 / 让它持续监听新消息\" "
                     "→ 走 `system.patrol.enable(name=\"job_chat.patrol\", trigger_now=false)`, "
                     "那边只开启长程调度; 用户明确要求\"现在处理一次\"才 trigger_now=true。"
+                    "5) 用户明确要\"现在就真实处理一轮未读\"时, 优先 `job.chat.process_once`。"
                 ),
                 parameters_schema={
                     "type": "object",

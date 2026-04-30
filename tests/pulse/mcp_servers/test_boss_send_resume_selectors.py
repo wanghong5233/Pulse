@@ -270,6 +270,75 @@ class TestResumeCardAgreePriority:
         )
 
 
+class TestResumeVerifyRecovery:
+    """When direct-toolbar verification fails but HR card agree is present,
+    executor should recover via card path instead of giving up immediately.
+    """
+
+    def test_executor_calls_recovery_helper_in_verify_failed_branch(self) -> None:
+        from pulse.mcp_servers import _boss_platform_runtime as runtime
+        import inspect
+
+        source = inspect.getsource(runtime._execute_browser_send_resume_attachment)
+        assert "_recover_resume_send_via_card_agree" in source, (
+            "Direct resume verify_failed branch must attempt card-agree "
+            "recovery before returning final verify_failed."
+        )
+
+    def test_recovery_helper_skips_when_no_agree_signal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pulse.mcp_servers import _boss_platform_runtime as runtime
+
+        def _should_not_be_called(_: object) -> tuple[object, str]:
+            raise AssertionError("locator probe should not run without agree signal")
+
+        monkeypatch.setattr(runtime, "_locate_resume_card_agree", _should_not_be_called)
+        result = runtime._recover_resume_send_via_card_agree(
+            page=object(),
+            conversation_id="conv-1",
+            current_url="https://x",
+            conversation_hint=None,
+            resume_profile_id="default",
+            send_verify={"ok": False, "current": {"agree_buttons": 0}, "before": {"agree_buttons": 0}},
+        )
+        assert result is None
+
+    def test_recovery_helper_marks_recovered_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from pulse.mcp_servers import _boss_platform_runtime as runtime
+
+        dummy_locator = object()
+        monkeypatch.setattr(
+            runtime,
+            "_locate_resume_card_agree",
+            lambda _: (dummy_locator, ".respond-popover .btn.btn-agree"),
+        )
+        monkeypatch.setattr(
+            runtime,
+            "_click_resume_card_agree",
+            lambda page, *, locator, selector, conversation_id: {
+                "ok": True,
+                "status": "sent",
+                "trigger_selector": selector,
+                "delivery_path": "respond_popover_agree",
+            },
+        )
+        result = runtime._recover_resume_send_via_card_agree(
+            page=object(),
+            conversation_id="conv-1",
+            current_url="https://chat",
+            conversation_hint={"company": "X"},
+            resume_profile_id="default",
+            send_verify={"ok": False, "current": {"agree_buttons": 1}, "before": {"agree_buttons": 0}},
+        )
+        assert result is not None
+        assert result["ok"] is True
+        assert result["recovered_from"] == "direct_resume_verify_failed"
+        assert result["url"] == "https://chat"
+
+
 class TestKillswitchDryRunIsDistinguishable:
     """PULSE_BOSS_MCP_REPLY_MODE=log_only/dry_run_ok must return a status
     that downstream code can recognise as 'not delivered'. Returning plain

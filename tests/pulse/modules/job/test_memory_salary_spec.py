@@ -228,6 +228,29 @@ def test_set_salary_floor_bare_int_is_backward_compatible(
     assert hc.salary_floor_spec is None
 
 
+def test_salary_spec_not_downgraded_by_equivalent_bare_int(
+    memory: JobMemory,
+) -> None:
+    """同一轮里若后续工具又写入等价裸整数, 不能把 source 覆盖掉。"""
+    memory.set_hard_constraint(
+        "salary_floor_monthly",
+        {"amount": 300, "unit": "yuan", "period": "day"},
+    )
+    memory.set_hard_constraint("salary_floor_monthly", 7)
+
+    hc = memory.get_hard_constraints()
+    assert hc.salary_floor_monthly == 7
+    assert hc.salary_floor_spec == {
+        "amount": 300.0,
+        "unit": "yuan",
+        "period": "day",
+        "work_days_per_month": 22,
+    }, (
+        "equivalent bare-int overwrite must preserve structured source, "
+        "otherwise verifier loses '300元/天' grounding"
+    )
+
+
 def test_snapshot_exposes_salary_spec(memory: JobMemory) -> None:
     memory.set_hard_constraint(
         "salary_floor_monthly",

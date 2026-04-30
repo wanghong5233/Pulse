@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -115,7 +116,12 @@ class SchedulerEngine:
         for task in self._tasks.values():
             if not self.is_due(task, now=current):
                 continue
-            outcome = task.handler()
+            if inspect.iscoroutinefunction(task.handler):
+                outcome = task.handler()
+            else:
+                # Run sync handlers off the scheduler event loop so a long
+                # patrol turn does not stall heartbeat/tick bookkeeping.
+                outcome = await asyncio.to_thread(task.handler)
             if inspect.isawaitable(outcome):
                 await outcome
             self._last_run_at[task.name] = current

@@ -116,6 +116,13 @@ def test_interactive_build_includes_three_part_tool_card() -> None:
     assert "Tool-Use Policy" in text
 
 
+def test_output_contract_enforces_delivery_claims_by_succeeded_counter() -> None:
+    contract = PromptContractBuilder()._section_output_contract()
+    assert "只有 succeeded>0 才能说\"已投递\"" in contract
+    assert "今日投递配额已满" in contract
+    assert "failed/skipped/preview" in contract
+
+
 # ---------------------------------------------------------------------------
 # P1-B regression guard (see audit trace_f3bda835ed94):
 # ``Relevant Past Conversations`` used to include hits whose similarity was

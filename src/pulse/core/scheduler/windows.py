@@ -18,14 +18,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Iterable
 
-try:
-    from zoneinfo import ZoneInfo  # type: ignore[import-not-found]
-except ImportError:  # pragma: no cover — py<3.9 兼容, Pulse 运行时要求 3.11+
-    from backports.zoneinfo import ZoneInfo  # type: ignore[import-not-found,no-redef]
-
-# 单用户自部署面向北京地区求职场景, 工作时间按北京时间解读. 若未来需要做
-# 多租户时, 把这个常量换成 per-user setting, 其它调用点无需改动.
-_BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+from pulse.core.clock import RUNTIME_TZ as _BEIJING_TZ
 
 
 def _as_beijing(now: datetime) -> datetime:

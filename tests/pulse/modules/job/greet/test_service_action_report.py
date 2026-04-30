@@ -78,6 +78,27 @@ def test_not_ready_report_is_failed_with_reason_embedded() -> None:
 
 
 # ──────────────────────────────────────────────────────────────
+# 2.5 quota_reached — policy short-circuit (daily cap hit)
+# ──────────────────────────────────────────────────────────────
+
+
+def test_quota_reached_report_is_skipped_with_daily_counters() -> None:
+    report = _build_trigger_action_report(
+        outcome="quota_reached",
+        daily_count=20,
+        daily_limit=20,
+    )
+    assert report.action == "job.greet"
+    assert report.status == "skipped"
+    assert "配额已满" in report.summary
+    assert report.metrics["attempted"] == 0
+    assert report.metrics["succeeded"] == 0
+    assert report.metrics["daily_count"] == 20
+    assert report.metrics["daily_limit"] == 20
+    assert report.details == ()
+
+
+# ──────────────────────────────────────────────────────────────
 # 3. preview — shortlisted but not sent
 # ──────────────────────────────────────────────────────────────
 

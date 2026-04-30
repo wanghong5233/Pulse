@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import logging
@@ -42,6 +43,7 @@ _PLAYWRIGHT_MANAGER = None
 _PLAYWRIGHT = None
 _CONTEXT = None
 _PAGE = None
+_BROWSER_LAST_USED_MONO = 0.0
 
 
 def _safe_int(raw: Any, default: int, *, min_value: int, max_value: int) -> int:
@@ -162,6 +164,50 @@ def _browser_timeout_ms() -> int:
         min_value=3000,
         max_value=90000,
     )
+
+
+def _browser_idle_close_sec() -> int:
+    """Idle timeout (seconds) before recycling the persistent browser session.
+
+    ``0`` means disabled. A non-zero value keeps the runtime warm for short
+    bursts (chat patrol loops) but releases resources after inactivity.
+    """
+    return _safe_int(
+        os.getenv("PULSE_BOSS_BROWSER_IDLE_CLOSE_SEC", "900"),
+        900,
+        min_value=0,
+        max_value=86400,
+    )
+
+
+def _mark_browser_used(*, now_mono: float | None = None) -> None:
+    global _BROWSER_LAST_USED_MONO
+    _BROWSER_LAST_USED_MONO = (
+        float(now_mono)
+        if now_mono is not None
+        else float(time.monotonic())
+    )
+
+
+def _browser_idle_elapsed_sec(*, now_mono: float | None = None) -> float:
+    last = float(_BROWSER_LAST_USED_MONO)
+    if last <= 0.0:
+        return 0.0
+    now_value = (
+        float(now_mono)
+        if now_mono is not None
+        else float(time.monotonic())
+    )
+    return max(0.0, now_value - last)
+
+
+def _should_recycle_browser_for_idle(*, now_mono: float | None = None) -> bool:
+    if _PAGE is None:
+        return False
+    idle_limit = _browser_idle_close_sec()
+    if idle_limit <= 0:
+        return False
+    return _browser_idle_elapsed_sec(now_mono=now_mono) >= float(idle_limit)
 
 
 def _browser_screenshot_dir() -> Path | None:
@@ -483,15 +529,111 @@ def _read_page_text(url: str, *, max_chars: int = 2500) -> str:
     return _clean_html(raw)[: max(500, min(max_chars, 8000))]
 
 
+def _shutdown_browser_runtime_unlocked(*, reason: str) -> dict[str, Any]:
+    """Close cached playwright objects.
+
+    Caller must hold ``_BROWSER_LOCK``.
+    """
+    global _PLAYWRIGHT_MANAGER, _PLAYWRIGHT, _CONTEXT, _PAGE, _BROWSER_LAST_USED_MONO
+    safe_reason = str(reason or "").strip() or "unspecified"
+    page = _PAGE
+    context = _CONTEXT
+    playwright_manager = _PLAYWRIGHT_MANAGER
+
+    _PAGE = None
+    _CONTEXT = None
+    _PLAYWRIGHT = None
+    _PLAYWRIGHT_MANAGER = None
+    _BROWSER_LAST_USED_MONO = 0.0
+
+    closed_page = False
+    closed_context = False
+    closed_playwright = False
+    errors: list[str] = []
+
+    if page is not None:
+        try:
+            is_closed = bool(page.is_closed())
+        except (RuntimeError, OSError, AttributeError, ValueError):
+            is_closed = False
+        if not is_closed:
+            try:
+                page.close()
+                closed_page = True
+            except (RuntimeError, OSError, AttributeError, ValueError) as exc:
+                errors.append(f"page_close:{exc}")
+
+    if context is not None:
+        try:
+            context.close()
+            closed_context = True
+        except (RuntimeError, OSError, AttributeError, ValueError) as exc:
+            errors.append(f"context_close:{exc}")
+
+    if playwright_manager is not None:
+        try:
+            playwright_manager.stop()
+            closed_playwright = True
+        except (RuntimeError, OSError, AttributeError, ValueError) as exc:
+            errors.append(f"playwright_stop:{exc}")
+
+    if errors:
+        logger.warning(
+            "boss browser cleanup finished with warnings reason=%s errors=%s",
+            safe_reason,
+            errors[:3],
+        )
+    else:
+        logger.info(
+            "boss browser cleanup completed reason=%s page=%s context=%s playwright=%s",
+            safe_reason,
+            closed_page,
+            closed_context,
+            closed_playwright,
+        )
+    return {
+        "ok": not errors,
+        "reason": safe_reason,
+        "closed_page": closed_page,
+        "closed_context": closed_context,
+        "closed_playwright": closed_playwright,
+        "errors": errors,
+    }
+
+
+def reset_browser_session(*, reason: str = "manual") -> dict[str, Any]:
+    """Manual cleanup entry for operators and runtime self-healing."""
+    with _BROWSER_LOCK:
+        return _shutdown_browser_runtime_unlocked(reason=reason)
+
+
+def _cleanup_browser_on_process_exit() -> None:
+    with _BROWSER_LOCK:
+        _shutdown_browser_runtime_unlocked(reason="process_exit")
+
+
+atexit.register(_cleanup_browser_on_process_exit)
+
+
 def _ensure_browser_page():
     global _PLAYWRIGHT_MANAGER, _PLAYWRIGHT, _CONTEXT, _PAGE
+    now_mono = float(time.monotonic())
     with _BROWSER_LOCK:
         if _PAGE is not None:
             try:
                 if not _PAGE.is_closed():
-                    return _PAGE
-            except Exception:
-                pass
+                    if _should_recycle_browser_for_idle(now_mono=now_mono):
+                        idle_elapsed = _browser_idle_elapsed_sec(now_mono=now_mono)
+                        _shutdown_browser_runtime_unlocked(
+                            reason=f"idle_timeout_{idle_elapsed:.1f}s"
+                        )
+                    else:
+                        _mark_browser_used(now_mono=now_mono)
+                        return _PAGE
+                else:
+                    _shutdown_browser_runtime_unlocked(reason="stale_page_handle")
+            except (RuntimeError, OSError, AttributeError, ValueError):
+                _shutdown_browser_runtime_unlocked(reason="page_probe_failed")
 
         try:
             from patchright.sync_api import sync_playwright
@@ -550,6 +692,7 @@ def _ensure_browser_page():
         _PAGE = _CONTEXT.pages[0] if _CONTEXT.pages else _CONTEXT.new_page()
         _PAGE.set_default_timeout(_browser_timeout_ms())
         _close_orphan_tabs(_CONTEXT, _PAGE)
+        _mark_browser_used(now_mono=float(time.monotonic()))
         return _PAGE
 
 
@@ -866,31 +1009,37 @@ def _extract_jobs_from_page(
     return result
 
 
-def _goto_next_search_page(page: Any) -> bool:
-    selectors = _csv_list(os.getenv("PULSE_BOSS_SEARCH_NEXT_SELECTORS", ""))
-    if not selectors:
-        selectors = _default_job_next_page_selectors()
-    next_loc, _selector = _wait_for_any_selector(page, selectors, timeout_ms=min(4000, _browser_timeout_ms()))
-    if next_loc is None:
-        return False
-    try:
-        next_loc.click(timeout=min(_browser_timeout_ms(), 8000))
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=min(_browser_timeout_ms(), 6000))
-        except Exception:
-            pass
-        page.wait_for_timeout(900)
-        return True
-    except Exception:
-        return False
+# 滚动驱动 scan 的硬天花板. evaluation_cap 通常远小于这个值, 但当
+# BOSS 反爬异常导致 plateau 检测失效时, 这条线兜底防止死循环.
+_SCAN_ABSOLUTE_SCROLL_CAP: int = 60
 
 
 def _scan_jobs_via_browser(
-    *, keyword: str, max_items: int, max_pages: int, city: str | None = None
+    *,
+    keyword: str,
+    target_count: int,
+    evaluation_cap: int,
+    scroll_plateau_rounds: int,
+    city: str | None = None,
 ) -> dict[str, Any]:
+    """Streaming scan: scroll the search sidebar until enough cards collected.
+
+    BOSS 直聘搜索结果页是 SPA 无限滚动, 同一关键词下侧栏向下滑动会持续
+    加载更多 JD. 不应该回退到"按下一页按钮 + max_pages"的分页假设 —
+    那会让我们卡在首屏几个候选, 与平台真实 UI 行为不符.
+
+    停止条件 (任一即停, 顺序为评估顺序):
+
+    1. ``len(rows) >= target_count``  目标候选数已满 (常态成功路径).
+    2. ``len(rows) >= evaluation_cap`` 总评估上限触顶, 由调用方控制成本.
+    3. 连续 ``scroll_plateau_rounds`` 次滚动后无新增卡片 → 真到底 (返回
+       ``exhausted=True``, 调用方据此决定是否进入关键词演化兜底).
+    4. ``_SCAN_ABSOLUTE_SCROLL_CAP`` 防御性硬上限.
+    """
     safe_keyword = str(keyword or "").strip() or "AI Agent 实习"
-    safe_items = _safe_int(max_items, 10, min_value=1, max_value=80)
-    safe_pages = _safe_int(max_pages, 2, min_value=1, max_value=8)
+    safe_target = _safe_int(target_count, 10, min_value=1, max_value=200)
+    safe_cap = _safe_int(evaluation_cap, max(safe_target, 30), min_value=safe_target, max_value=200)
+    safe_plateau = _safe_int(scroll_plateau_rounds, 3, min_value=1, max_value=8)
     safe_city = (str(city).strip() or None) if city else None
     try:
         page = _ensure_browser_page()
@@ -899,117 +1048,117 @@ def _scan_jobs_via_browser(
             "ok": False,
             "status": "executor_unavailable",
             "items": [],
-            "pages_scanned": 0,
+            "scroll_count": 0,
+            "exhausted": False,
             "source": "boss_mcp_browser_scan",
             "errors": [str(exc)[:300]],
         }
 
-    use_page_template = "{page}" in _search_url_template()
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     errors: list[str] = []
-    pages_scanned = 0
+    scroll_count = 0
+    plateau_streak = 0
+    exhausted = False
 
-    for index in range(1, safe_pages + 1):
-        extracted: list[dict[str, Any]] = []
-        page_ready = False
+    candidates = _build_search_url_candidates(
+        keyword=safe_keyword, page=1, city=safe_city
+    )
+    page_ready = False
+    for target_url in candidates:
+        try:
+            page.goto(target_url, wait_until="domcontentloaded", timeout=_browser_timeout_ms())
+            page_ready = True
+        except Exception as exc:
+            errors.append(f"page navigation failed: {str(exc)[:220]}")
+            continue
+        risk_status = _detect_runtime_risk(page, current_url=str(page.url or ""))
+        if risk_status:
+            errors.append(f"risk status={risk_status}; url={str(page.url or '')[:160]}")
+            page_ready = False
+            continue
+        break
 
-        if index == 1 or use_page_template:
-            candidates = _build_search_url_candidates(
-                keyword=safe_keyword, page=index, city=safe_city
-            )
-            for target_url in candidates:
-                try:
-                    page.goto(target_url, wait_until="domcontentloaded", timeout=_browser_timeout_ms())
-                    page_ready = True
-                except Exception as exc:
-                    errors.append(f"page navigation failed: {str(exc)[:220]}")
-                    continue
-                current_url = str(page.url or "")
-                risk_status = _detect_runtime_risk(page, current_url=current_url)
-                if risk_status:
-                    errors.append(f"risk status={risk_status}; url={current_url[:160]}")
-                    continue
-                extracted = _extract_jobs_with_retries(
-                    page,
-                    keyword=safe_keyword,
-                    max_items=max(1, safe_items - len(rows)),
-                    seen_keys=seen,
-                )
-                if extracted:
-                    break
-        else:
-            moved = _goto_next_search_page(page)
-            if moved:
-                page_ready = True
-                current_url = str(page.url or "")
-                risk_status = _detect_runtime_risk(page, current_url=current_url)
-                if risk_status:
-                    errors.append(f"risk status={risk_status}; url={current_url[:160]}")
-                else:
-                    extracted = _extract_jobs_with_retries(
-                        page,
-                        keyword=safe_keyword,
-                        max_items=max(1, safe_items - len(rows)),
-                        seen_keys=seen,
-                    )
+    if not page_ready:
+        nav_ok, nav_url = _navigate_jobs_from_chat(page, keyword=safe_keyword)
+        if nav_ok and not _detect_runtime_risk(page, current_url=nav_url):
+            page_ready = True
 
-        if not extracted and index == 1:
-            nav_ok, nav_url = _navigate_jobs_from_chat(page, keyword=safe_keyword)
-            if nav_ok:
-                page_ready = True
-                risk_status = _detect_runtime_risk(page, current_url=nav_url)
-                if not risk_status:
-                    extracted = _extract_jobs_with_retries(
-                        page,
-                        keyword=safe_keyword,
-                        max_items=max(1, safe_items - len(rows)),
-                        seen_keys=seen,
-                    )
-                else:
-                    errors.append(f"risk status={risk_status}; url={nav_url[:160]}")
-
-        if not extracted and index == 1:
-            # 真实平台兜底：从聊天页提取岗位沟通线索，不回退到 mock。
-            try:
-                page.goto(_chat_list_url(), wait_until="domcontentloaded", timeout=_browser_timeout_ms())
-                page_ready = True
-                current_url = str(page.url or "")
-                risk_status = _detect_runtime_risk(page, current_url=current_url)
-                if not risk_status:
-                    extracted = _extract_job_leads_from_chat_page(
-                        page,
-                        keyword=safe_keyword,
-                        max_items=max(1, safe_items - len(rows)),
-                        seen_keys=seen,
-                    )
-            except Exception as exc:
-                errors.append(f"chat lead fallback failed: {str(exc)[:220]}")
-
-        if not page_ready:
-            break
-
-        pages_scanned = index
-        rows.extend(extracted)
-        if len(rows) >= safe_items:
-            break
-
-    if rows:
+    if not page_ready:
         return {
-            "ok": True,
-            "status": "ready",
-            "items": rows[:safe_items],
-            "pages_scanned": max(1, pages_scanned),
+            "ok": False,
+            "status": "navigate_failed",
+            "items": [],
+            "scroll_count": 0,
+            "exhausted": False,
             "source": "boss_mcp_browser_scan",
-            "errors": errors,
+            "errors": errors or ["browser scan failed: page not reachable"],
+        }
+
+    initial = _extract_jobs_with_retries(
+        page,
+        keyword=safe_keyword,
+        max_items=safe_cap,
+        seen_keys=seen,
+    )
+    rows.extend(initial)
+
+    while (
+        len(rows) < safe_target
+        and len(rows) < safe_cap
+        and scroll_count < _SCAN_ABSOLUTE_SCROLL_CAP
+    ):
+        try:
+            page.mouse.wheel(0, 1500)
+        except Exception as exc:
+            errors.append(f"scroll wheel failed: {str(exc)[:200]}")
+            break
+        try:
+            page.wait_for_load_state("networkidle", timeout=min(_browser_timeout_ms(), 2500))
+        except Exception:
+            pass
+        page.wait_for_timeout(700)
+        scroll_count += 1
+
+        risk_status = _detect_runtime_risk(page, current_url=str(page.url or ""))
+        if risk_status:
+            errors.append(f"risk status={risk_status}; aborted at scroll={scroll_count}")
+            break
+
+        added = _extract_jobs_from_page(
+            page,
+            keyword=safe_keyword,
+            max_items=safe_cap - len(rows),
+            seen_keys=seen,
+        )
+        if added:
+            rows.extend(added)
+            plateau_streak = 0
+        else:
+            plateau_streak += 1
+            if plateau_streak >= safe_plateau:
+                exhausted = True
+                break
+
+    items = rows[:safe_cap]
+    if not items:
+        return {
+            "ok": False,
+            "status": "no_result",
+            "items": [],
+            "scroll_count": scroll_count,
+            "exhausted": exhausted or plateau_streak >= safe_plateau,
+            "source": "boss_mcp_browser_scan",
+            "errors": errors or ["browser scan returned no jobs"],
         }
     return {
-        "ok": False,
-        "status": "no_result",
-        "items": [],
-        "pages_scanned": max(1, pages_scanned),
+        "ok": True,
+        "status": "ready",
+        "items": items,
+        "scroll_count": scroll_count,
+        "exhausted": exhausted,
         "source": "boss_mcp_browser_scan",
-        "errors": errors or ["browser scan returned no jobs"],
+        "errors": errors,
     }
 
 
@@ -1572,6 +1721,7 @@ def _normalize_conversation_rows(
         result.append(
             {
                 "conversation_id": conversation_id,
+                "conversation_url": _build_chat_url(conversation_id),
                 "hr_name": hr_name[:80],
                 "company": company[:120],
                 "job_title": job_title[:160],
@@ -2154,6 +2304,9 @@ def _enrich_rows_with_latest_hr_message(
                 arg=[target["hr_name"]],
                 timeout=detail_timeout_ms,
             )
+            current_chat_url = str(getattr(page, "url", "") or "").strip()
+            if current_chat_url:
+                row["conversation_url"] = current_chat_url
             text = str(page.evaluate(read_hr_js) or "").strip()
             row["latest_message"] = token_preview(text, max_tokens=1000)
             row["hr_has_spoken"] = bool(text)
@@ -3092,6 +3245,54 @@ def _click_resume_card_agree(
     }
 
 
+def _recover_resume_send_via_card_agree(
+    *,
+    page: Any,
+    conversation_id: str,
+    current_url: str,
+    conversation_hint: dict[str, Any] | None,
+    resume_profile_id: str,
+    send_verify: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Fallback after direct-button verify_failed.
+
+    When BOSS keeps an in-thread "交换简历" card alive, toolbar "发简历"
+    clicks can produce no DOM delta while the card "同意" path still works.
+    Only attempt recovery when the verifier snapshot reports visible agree
+    buttons; otherwise keep the original fail-loud verify_failed contract.
+    """
+    verify = send_verify if isinstance(send_verify, dict) else {}
+    current = verify.get("current") if isinstance(verify.get("current"), dict) else {}
+    before = verify.get("before") if isinstance(verify.get("before"), dict) else {}
+    agree_now = int(current.get("agree_buttons") or 0)
+    agree_before = int(before.get("agree_buttons") or 0)
+    if max(agree_now, agree_before) <= 0:
+        return None
+
+    card_loc, card_selector = _locate_resume_card_agree(page)
+    if card_loc is None:
+        return None
+    logger.info(
+        "send_resume.recover_via_card conv=%s agree_now=%s agree_before=%s card_selector=%s",
+        conversation_id[:20],
+        agree_now,
+        agree_before,
+        card_selector or "-",
+    )
+    card_result = _click_resume_card_agree(
+        page,
+        locator=card_loc,
+        selector=card_selector,
+        conversation_id=conversation_id,
+    )
+    card_result.setdefault("url", current_url)
+    card_result.setdefault("conversation_hint", dict(conversation_hint or {}))
+    card_result.setdefault("resume_profile_id", resume_profile_id)
+    card_result.setdefault("attachment_path", None)
+    card_result.setdefault("recovered_from", "direct_resume_verify_failed")
+    return card_result
+
+
 def _execute_browser_send_resume_attachment(
     *,
     conversation_id: str,
@@ -3299,6 +3500,22 @@ def _execute_browser_send_resume_attachment(
             )
             send_verify["confirm_clicked"] = True
             if not bool(send_verify.get("ok")):
+                recovery = _recover_resume_send_via_card_agree(
+                    page=page,
+                    conversation_id=safe_conv,
+                    current_url=current_url,
+                    conversation_hint=conversation_hint,
+                    resume_profile_id=safe_profile,
+                    send_verify=send_verify,
+                )
+                if isinstance(recovery, dict) and bool(recovery.get("ok")):
+                    logger.info(
+                        "send_resume.recover_success conv=%s trigger=%s path=%s",
+                        safe_conv[:20],
+                        trigger_selector,
+                        used_path,
+                    )
+                    return recovery
                 logger.warning(
                     "send_resume.verify_failed conv=%s trigger=%s path=%s confirm=%s verify=%s",
                     safe_conv[:20],
@@ -3320,6 +3537,7 @@ def _execute_browser_send_resume_attachment(
                     "confirm_selector": confirm_selector,
                     "delivery_path": used_path,
                     "send_verify": send_verify,
+                    "recovery_result": recovery if isinstance(recovery, dict) else None,
                 }
         elif not is_direct_resume_button:
             return {
@@ -3338,6 +3556,22 @@ def _execute_browser_send_resume_attachment(
                 timeout_ms=min(_browser_timeout_ms(), 8000),
             )
             if not bool(send_verify.get("ok")):
+                recovery = _recover_resume_send_via_card_agree(
+                    page=page,
+                    conversation_id=safe_conv,
+                    current_url=current_url,
+                    conversation_hint=conversation_hint,
+                    resume_profile_id=safe_profile,
+                    send_verify=send_verify,
+                )
+                if isinstance(recovery, dict) and bool(recovery.get("ok")):
+                    logger.info(
+                        "send_resume.recover_success conv=%s trigger=%s path=%s",
+                        safe_conv[:20],
+                        trigger_selector,
+                        used_path,
+                    )
+                    return recovery
                 logger.warning(
                     "send_resume.verify_failed conv=%s trigger=%s verify=%s",
                     safe_conv[:20],
@@ -3353,6 +3587,7 @@ def _execute_browser_send_resume_attachment(
                     "trigger_selector": trigger_selector,
                     "delivery_path": used_path,
                     "send_verify": send_verify,
+                    "recovery_result": recovery if isinstance(recovery, dict) else None,
                 }
 
         screenshot_path = _take_browser_screenshot(
@@ -3821,14 +4056,41 @@ def _find_recent_successful_action(
 def scan_jobs(
     *,
     keyword: str,
-    max_items: int,
-    max_pages: int,
+    max_items: int | None = None,
+    max_pages: int | None = None,
+    target_count: int | None = None,
+    evaluation_cap: int | None = None,
+    scroll_plateau_rounds: int | None = None,
     job_type: str = "all",
     city: str | None = None,
 ) -> dict[str, Any]:
+    """Scan jobs via streaming scroll (preferred) or web-search fallback.
+
+    Parameter contract:
+      * ``target_count`` — desired # of cards before stopping early. Falls
+        back to ``max_items`` for back-compat.
+      * ``evaluation_cap`` — hard ceiling on how many cards we will return,
+        regardless of target. Defaults to ``max(target_count, 60)`` so a
+        small ``target`` still gives the host enough headroom for
+        list-stage filtering. ``max_pages`` is no longer used as a
+        pagination knob (BOSS uses infinite scroll); it survives only as
+        a deprecated alias for ``evaluation_cap`` budgeting.
+      * ``scroll_plateau_rounds`` — # of scrolls with zero new cards
+        before declaring the sidebar exhausted (defaults to 3).
+
+    Returned payload always includes ``exhausted: bool`` so the host can
+    distinguish "ran out of budget" from "list truly ended".
+    """
     safe_keyword = str(keyword or "").strip() or "AI Agent 实习"
-    safe_items = _safe_int(max_items, 10, min_value=1, max_value=80)
-    safe_pages = _safe_int(max_pages, 2, min_value=1, max_value=8)
+    legacy_max_items = _safe_int(max_items, 10, min_value=1, max_value=200) if max_items is not None else 10
+    safe_target = _safe_int(target_count, legacy_max_items, min_value=1, max_value=200)
+    default_cap = max(safe_target, 60)
+    if evaluation_cap is None and max_pages is not None:
+        # Back-compat: legacy callers passed max_pages~=2; we treat it as a
+        # rough budget signal and inflate it to a per-card cap.
+        default_cap = max(default_cap, _safe_int(max_pages, 2, min_value=1, max_value=8) * 30)
+    safe_cap = _safe_int(evaluation_cap, default_cap, min_value=safe_target, max_value=200)
+    safe_plateau = _safe_int(scroll_plateau_rounds, 3, min_value=1, max_value=8)
     _ = str(job_type or "all").strip() or "all"
     safe_city = (str(city).strip() or None) if city else None
     mode = _scan_mode()
@@ -3837,16 +4099,32 @@ def scan_jobs(
     if mode in {"browser_only", "browser_first"}:
         browser_result = _scan_jobs_via_browser(
             keyword=safe_keyword,
-            max_items=safe_items,
-            max_pages=safe_pages,
+            target_count=safe_target,
+            evaluation_cap=safe_cap,
+            scroll_plateau_rounds=safe_plateau,
             city=safe_city,
         )
         browser_items = browser_result.get("items")
         if isinstance(browser_items, list) and browser_items:
+            logger.info(
+                "boss.scan.browser.ready keyword=%s city=%s target=%d cap=%d "
+                "scroll=%d exhausted=%s items=%d",
+                safe_keyword,
+                safe_city or "nationwide",
+                safe_target,
+                safe_cap,
+                _safe_int(browser_result.get("scroll_count"), 0, min_value=0, max_value=200),
+                bool(browser_result.get("exhausted")),
+                len(browser_items),
+            )
             return {
                 "ok": True,
-                "items": browser_items[:safe_items],
-                "pages_scanned": max(1, _safe_int(browser_result.get("pages_scanned"), 1, min_value=1, max_value=99)),
+                "items": browser_items[:safe_cap],
+                "scroll_count": _safe_int(browser_result.get("scroll_count"), 0, min_value=0, max_value=200),
+                "exhausted": bool(browser_result.get("exhausted")),
+                # pages_scanned is preserved only for back-compat with
+                # observers/dashboards that read the old field.
+                "pages_scanned": 1 + _safe_int(browser_result.get("scroll_count"), 0, min_value=0, max_value=200),
                 "source": str(browser_result.get("source") or "boss_mcp_browser_scan"),
                 "errors": list(browser_result.get("errors") or []),
                 "mode": mode,
@@ -3859,10 +4137,20 @@ def scan_jobs(
         if browser_url:
             browser_errors.append(f"browser_url={browser_url}")
         if mode == "browser_only":
+            logger.warning(
+                "boss.scan.browser.failed keyword=%s city=%s target=%d cap=%d status=%s",
+                safe_keyword,
+                safe_city or "nationwide",
+                safe_target,
+                safe_cap,
+                str(browser_result.get("status") or "unknown"),
+            )
             return {
                 "ok": bool(browser_result.get("ok")),
                 "items": list(browser_items or []),
-                "pages_scanned": max(1, _safe_int(browser_result.get("pages_scanned"), 1, min_value=1, max_value=99)),
+                "scroll_count": _safe_int(browser_result.get("scroll_count"), 0, min_value=0, max_value=200),
+                "exhausted": bool(browser_result.get("exhausted")),
+                "pages_scanned": 1 + _safe_int(browser_result.get("scroll_count"), 0, min_value=0, max_value=200),
                 "source": str(browser_result.get("source") or "boss_mcp_browser_scan"),
                 "errors": browser_errors or [f"browser scan failed: {str(browser_result.get('status') or 'unknown')}"],
                 "mode": mode,
@@ -3877,16 +4165,18 @@ def scan_jobs(
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     errors: list[str] = list(browser_errors)
-    pages_scanned = 0
-    for query in query_pool[:safe_pages]:
-        pages_scanned += 1
+    queries_run = 0
+    for query in query_pool:
+        if len(rows) >= safe_target:
+            break
+        queries_run += 1
         try:
-            hits = search_web(query, max_results=min(12, safe_items * 2))
+            hits = search_web(query, max_results=min(12, safe_cap * 2))
         except Exception as exc:
             errors.append(str(exc)[:300])
             continue
         for hit in hits:
-            if len(rows) >= safe_items:
+            if len(rows) >= safe_cap:
                 break
             source_url = str(hit.url or "").strip()
             title_raw = str(hit.title or "").strip()
@@ -3912,11 +4202,9 @@ def scan_jobs(
                     "collected_at": datetime.now(timezone.utc).isoformat(),
                 }
             )
-        if len(rows) >= safe_items:
-            break
     if not rows and _allow_seed_fallback():
         seeded = int(hashlib.sha1(safe_keyword.encode("utf-8")).hexdigest()[:8], 16)
-        for idx in range(safe_items):
+        for idx in range(safe_target):
             title, company, salary = _SEED_JOBS[(seeded + idx) % len(_SEED_JOBS)]
             source_url = f"https://www.zhipin.com/job_detail/seed_{seeded}_{idx}"
             rows.append(
@@ -3937,10 +4225,14 @@ def scan_jobs(
     source = "boss_mcp_web_search"
     if rows and rows[0].get("source") == "boss_mcp_seed":
         source = "boss_mcp_seed"
+    # Web-search fallback has no scrolling concept; report exhausted=True
+    # so reflection layer can decide whether to evolve keywords.
     return {
         "ok": bool(rows),
-        "items": rows[:safe_items],
-        "pages_scanned": max(1, pages_scanned),
+        "items": rows[:safe_cap],
+        "scroll_count": 0,
+        "exhausted": True,
+        "pages_scanned": max(1, queries_run),
         "source": source,
         "errors": errors,
         "mode": mode,
@@ -4774,6 +5066,15 @@ def mark_processed(*, conversation_id: str, run_id: str, note: str = "") -> dict
 
 
 def health() -> dict[str, Any]:
+    with _BROWSER_LOCK:
+        runtime_open = False
+        if _PAGE is not None:
+            try:
+                runtime_open = not bool(_PAGE.is_closed())
+            except (RuntimeError, OSError, AttributeError, ValueError):
+                runtime_open = True
+        idle_elapsed_sec = round(_browser_idle_elapsed_sec(), 3)
+        idle_close_sec = _browser_idle_close_sec()
     return {
         "ok": True,
         "source": "boss_mcp",
@@ -4801,6 +5102,9 @@ def health() -> dict[str, Any]:
             "screenshot_dir": str(_browser_screenshot_dir()) if _browser_screenshot_dir() is not None else None,
             "executor_retry_count": _browser_executor_retry_count(),
             "executor_retry_backoff_ms": _browser_executor_retry_backoff_ms(),
+            "idle_close_sec": idle_close_sec,
+            "idle_elapsed_sec": idle_elapsed_sec,
+            "runtime_open": runtime_open,
             "risk_keywords": _risk_keywords(),
             "greet_button_selectors": _csv_list(os.getenv("PULSE_BOSS_GREET_BUTTON_SELECTORS", "")),
             "chat_input_selectors": _csv_list(os.getenv("PULSE_BOSS_CHAT_INPUT_SELECTORS", "")),

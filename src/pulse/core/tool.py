@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
@@ -168,7 +169,13 @@ class ToolRegistry:
         if entry is None:
             raise KeyError(f"tool not found: {safe_name}")
         payload = dict(args or {})
-        result = entry.handler(payload)
+
+        # Keep the main event loop responsive for channel heartbeats.
+        # Many module/MCP tools are sync + blocking (HTTP/browser I/O).
+        if inspect.iscoroutinefunction(entry.handler):
+            result = entry.handler(payload)
+        else:
+            result = await asyncio.to_thread(entry.handler, payload)
         if inspect.isawaitable(result):
             return await result
         return result

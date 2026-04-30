@@ -351,6 +351,7 @@ Step A 把 `run_auto_reply_cycle` 做成可被 MCP tool / 脚本调用的 rule-b
 - `enable`(默认 `trigger_now=false`) vs `trigger`:enable 翻 `ScheduleTask.enabled=true`,不立即跑业务 tick;`trigger` 只跑一次,**不**改 `enabled` 标志。用户说"只跑这一次不要开" → `trigger`;用户说"开启 / 启动 / 托管 / 帮我持续监听" → `enable`;用户明确说"开启并马上处理一次" → `enable(trigger_now=true)`
 - `enable` + `job.chat.process` / `job.greet.trigger` 的分流:"长程监听 / 持续处理新消息 / 自动投递服务" → `enable(name="job_chat.patrol" 或 "job_greet.patrol")`;"就扫一次当前未读,跑完别再跑" → `job.chat.process`;"现在立刻投一批" → `job.greet.trigger`。业务 tool 的 `when_not_to_use` 显式把长程意图回流给 enable。
 - `disable` vs `/api/runtime/pause`:前者关单条,后者关所有(升级 / 接管场景)
+- `disable` vs `/api/runtime/stop`:前者只改单条 patrol 的调度位,不影响 runtime 进程;后者是进程级停机,默认先 `disarm_patrols=true` 去武装全部 patrol 再 stop
 - `enable` 不绕过业务层 killswitch:`PULSE_BOSS_AUTOREPLY=off` 仍会让 handler return `{status:"disabled"}`;enable 只是把 patrol 放回调度队列,不改业务语义
 
 **`trigger_now` 默认 `false` 的理由**:服务开启是控制面操作,应快速返回并等待调度窗口;立即跑一次是业务面操作,可能触发浏览器、LLM 和平台副作用。`trigger_now=true` 只用于用户显式要求"现在跑一次 / 顺便处理当前未读 / 马上投一批"的复合意图。
@@ -362,6 +363,7 @@ Step A 把 `run_auto_reply_cycle` 做成可被 MCP tool / 脚本调用的 rule-b
 | `runtime.patrol.lifecycle.enabled` | `enable_patrol(name)` 命中已注册 patrol | `{task_name}` |
 | `runtime.patrol.lifecycle.disabled` | `disable_patrol(name)` 命中已注册 patrol | `{task_name}` |
 | `runtime.patrol.lifecycle.triggered` | `run_patrol_once(name)` 进入 `_execute_patrol` 前 | `{task_name}` |
+| `runtime.patrols.disarmed` | `disarm_patrols` 完成后 | `{disabled[], already_disabled[], failed[]}` |
 
 已有事件(`runtime.patrol.started / completed / degraded / failed / circuit_breaker`)在 `_execute_patrol` 中继续发出,**不重复**。
 
@@ -374,6 +376,7 @@ Step A 把 `run_auto_reply_cycle` 做成可被 MCP tool / 脚本调用的 rule-b
 | `/api/runtime/patrols/{name}/enable` | POST | `system.patrol.enable` |
 | `/api/runtime/patrols/{name}/disable` | POST | `system.patrol.disable` |
 | `/api/runtime/patrols/{name}/trigger` | POST | `system.patrol.trigger` |
+| `/api/runtime/stop` | POST | 进程级停机(运维面)。默认 `disarm_patrols=true` |
 
 IntentSpec 和 HTTP 路由**语义完全对等**,共享同一底层 `AgentRuntime` API;前者给 LLM tool_use,后者给 CLI / 前端 / 运维脚本。
 

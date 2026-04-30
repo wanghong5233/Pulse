@@ -45,8 +45,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import blake2s
 from typing import Any, Callable, Literal, Mapping
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
+from pulse.core.action_report import ACTION_REPORT_KEY, ActionDetail, ActionReport
 from pulse.core.notify.notifier import Notification, Notifier
 from pulse.core.safety import (
     AskRequest,
@@ -130,6 +132,76 @@ def _lift_error(ok: bool, *parts: dict[str, Any]) -> str | None:
 # 介入。Service 不能把这些一视同仁塞回 "sent", 否则 trace_f78829ce4576 那种
 # 01:46 1ms send_resume "成功" 会重现。
 _TRUE_DELIVERY_STATUSES: frozenset[str] = frozenset({"sent", "clicked"})
+_CHAT_LIST_URL = "https://www.zhipin.com/web/geek/chat"
+
+
+def _safe_chat_url(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not (text.startswith("http://") or text.startswith("https://")):
+        return ""
+    return text[:600]
+
+
+def _fallback_conversation_url(conversation_id: str) -> str:
+    safe_id = str(conversation_id or "").strip()
+    if not safe_id:
+        return _CHAT_LIST_URL
+    return f"{_CHAT_LIST_URL}?conversationId={safe_id}"
+
+
+def _extract_conversation_id_from_chat_url(url: str) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return ""
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    values = query.get("conversationId") or []
+    for value in values:
+        safe = str(value or "").strip()
+        if safe:
+            return safe[:120]
+    return ""
+
+
+def _extract_execution_url(execution: Mapping[str, Any] | None) -> str:
+    if not execution:
+        return ""
+    direct = _safe_chat_url(
+        execution.get("conversation_url")
+        or execution.get("chat_url")
+        or execution.get("url")
+    )
+    if direct:
+        return direct
+    for key in ("reply_result", "attach_result", "click_result", "mark_result", "result"):
+        nested = execution.get(key)
+        if not isinstance(nested, Mapping):
+            continue
+        candidate = _safe_chat_url(
+            nested.get("conversation_url")
+            or nested.get("chat_url")
+            or nested.get("url")
+        )
+        if candidate:
+            return candidate
+        nested_result = nested.get("result")
+        if not isinstance(nested_result, Mapping):
+            continue
+        candidate = _safe_chat_url(
+            nested_result.get("conversation_url")
+            or nested_result.get("chat_url")
+            or nested_result.get("url")
+        )
+        if candidate:
+            return candidate
+    return ""
 
 
 # 卡片类型枚举 → 给用户看的中文描述. 仅用于 ask 文案, 映射缺失时回落到
@@ -504,11 +576,26 @@ class JobChatService:
             ChatAction.REJECT_CARD,
         }
         for row in conversations:
-            conversation_id = str(row.get("conversation_id") or "")
+            raw_conversation_id = str(row.get("conversation_id") or "").strip()
+            conversation_url = _safe_chat_url(row.get("conversation_url"))
+            url_conversation_id = _extract_conversation_id_from_chat_url(conversation_url)
+            if url_conversation_id and url_conversation_id != raw_conversation_id:
+                row = dict(row)
+                row["conversation_id"] = url_conversation_id
+            conversation_id = str(row.get("conversation_id") or "").strip()
+            if not conversation_url:
+                conversation_url = _fallback_conversation_url(conversation_id)
+            cards = list(row.get("cards") or [])
             has_resume_card = any(
                 card.get("card_type") == CardType.EXCHANGE_RESUME.value
-                for card in row.get("cards") or []
+                for card in cards
             )
+            card_title = ""
+            for card in cards:
+                text = str(card.get("title") or "").strip()
+                if text:
+                    card_title = text[:160]
+                    break
             initiated_by_raw = str(row.get("initiated_by") or "").strip().lower()
             try:
                 initiated_by = ConversationInitiator(initiated_by_raw)
@@ -576,14 +663,28 @@ class JobChatService:
                 )
             items.append(
                 {
-                    "conversation_id": row["conversation_id"],
+                    "conversation_id": conversation_id,
+                    "conversation_id_source": "url" if url_conversation_id else "row",
+                    "conversation_url": conversation_url,
                     "hr_name": row["hr_name"],
                     "company": row["company"],
                     "job_title": row["job_title"],
+                    "conversation_title": " / ".join(
+                        [
+                            part
+                            for part in (
+                                str(row.get("hr_name") or "").strip(),
+                                str(row.get("company") or "").strip(),
+                                str(row.get("job_title") or "").strip(),
+                            )
+                            if part
+                        ]
+                    )[:240],
+                    "card_title": card_title,
                     "latest_hr_message": row["latest_message"],
                     "latest_hr_time": row["latest_time"],
                     "initiated_by": row.get("initiated_by") or ConversationInitiator.UNKNOWN.value,
-                    "cards": row.get("cards") or [],
+                    "cards": cards,
                     "action": plan.action.value,
                     "reason": plan.reason,
                     "reply_text": plan.reply_text,
@@ -621,6 +722,15 @@ class JobChatService:
             },
             "errors": errors,
         }
+        action_report = self._build_process_action_report(
+            items=items,
+            source=source,
+            chat_tab=chat_tab,
+            auto_execute=auto_execute,
+            confirm_execute=confirm_execute,
+            errors=errors,
+        )
+        result[ACTION_REPORT_KEY] = action_report.to_dict()
         action_counts: dict[str, int] = {}
         for item in items:
             key = str(item.get("action") or "unknown")
@@ -1128,29 +1238,32 @@ class JobChatService:
             profile_id=profile_id,
             conversation_hint=dict(conversation_hint or {}),
         )
-        mark_result = self._connector.mark_processed(
-            conversation_id=conversation_id,
-            run_id=run_id or datetime.now(timezone.utc).strftime("chat-%Y%m%d%H%M%S"),
-            note=note or "execute action=reply",
-        )
-        ok = bool(reply_result.get("ok")) and bool(mark_result.get("ok"))
         # 把下游 MCP 的真实 status 透传回来, 而不是把 "logged" / "manual_required"
         # 等干跑路径强行升级成 "sent"。status 升级是 trace_f78829ce4576 / 01:46
         # 1ms send_resume 假绿的根因。
         reply_status = str(reply_result.get("status") or "").strip().lower()
-        if ok and reply_status in _TRUE_DELIVERY_STATUSES:
+        delivered = bool(reply_result.get("ok")) and reply_status in _TRUE_DELIVERY_STATUSES
+        mark_result: dict[str, Any] | None = None
+        if delivered:
+            mark_result = self._connector.mark_processed(
+                conversation_id=conversation_id,
+                run_id=run_id or datetime.now(timezone.utc).strftime("chat-%Y%m%d%H%M%S"),
+                note=note or "execute action=reply",
+            )
+        ok = delivered and bool((mark_result or {}).get("ok"))
+        if ok:
             final_status = "sent"
-        elif ok:
+        elif delivered:
             final_status = reply_status or "unknown"
         else:
             final_status = reply_status or "failed"
         return {
-            "ok": ok and reply_status in _TRUE_DELIVERY_STATUSES,
+            "ok": ok,
             "status": final_status,
             "error": _lift_error(
-                ok and reply_status in _TRUE_DELIVERY_STATUSES,
+                ok,
                 reply_result,
-                mark_result,
+                mark_result or {},
             ),
             "reply_result": reply_result,
             "mark_result": mark_result,
@@ -1211,28 +1324,31 @@ class JobChatService:
             resume_profile_id=profile_id or self._policy.default_profile_id,
             conversation_hint=dict(conversation_hint or {}),
         )
-        mark_result = self._connector.mark_processed(
-            conversation_id=conversation_id,
-            run_id=run_id or datetime.now(timezone.utc).strftime("chat-%Y%m%d%H%M%S"),
-            note=note or "execute action=send_resume",
-        )
-        ok = bool(attach_result.get("ok")) and bool(mark_result.get("ok"))
         attach_status = str(attach_result.get("status") or "").strip().lower()
+        delivered = bool(attach_result.get("ok")) and attach_status in _TRUE_DELIVERY_STATUSES
+        mark_result: dict[str, Any] | None = None
+        if delivered:
+            mark_result = self._connector.mark_processed(
+                conversation_id=conversation_id,
+                run_id=run_id or datetime.now(timezone.utc).strftime("chat-%Y%m%d%H%M%S"),
+                note=note or "execute action=send_resume",
+            )
+        ok = delivered and bool((mark_result or {}).get("ok"))
         # dry-run / killswitch 路径 (status=logged / logged_only / manual_required)
         # 必须透传, 绝不重写为 "sent"。否则 env 一改 dry-run 就恢复假绿。
-        if ok and attach_status in _TRUE_DELIVERY_STATUSES:
+        if ok:
             final_status = "sent"
-        elif ok:
+        elif delivered:
             final_status = attach_status or "unknown"
         else:
             final_status = attach_status or "failed"
         return {
-            "ok": ok and attach_status in _TRUE_DELIVERY_STATUSES,
+            "ok": ok,
             "status": final_status,
             "error": _lift_error(
-                ok and attach_status in _TRUE_DELIVERY_STATUSES,
+                ok,
                 attach_result,
-                mark_result,
+                mark_result or {},
             ),
             "attach_result": attach_result,
             "mark_result": mark_result,
@@ -1322,30 +1438,195 @@ class JobChatService:
             card_type=safe_card_type,
             action=action.value,
         )
-        mark_result = self._connector.mark_processed(
-            conversation_id=conversation_id,
-            run_id=run_id or datetime.now(timezone.utc).strftime("chat-%Y%m%d%H%M%S"),
-            note=note or f"execute action=card.{action.value}",
-        )
-        ok = bool(click_result.get("ok")) and bool(mark_result.get("ok"))
         click_status = str(click_result.get("status") or "").strip().lower()
-        if ok and click_status in _TRUE_DELIVERY_STATUSES:
+        delivered = bool(click_result.get("ok")) and click_status in _TRUE_DELIVERY_STATUSES
+        mark_result: dict[str, Any] | None = None
+        if delivered:
+            mark_result = self._connector.mark_processed(
+                conversation_id=conversation_id,
+                run_id=run_id or datetime.now(timezone.utc).strftime("chat-%Y%m%d%H%M%S"),
+                note=note or f"execute action=card.{action.value}",
+            )
+        ok = delivered and bool((mark_result or {}).get("ok"))
+        if ok:
             final_status = "clicked"
-        elif ok:
+        elif delivered:
             final_status = click_status or "unknown"
         else:
             final_status = click_status or "failed"
         return {
-            "ok": ok and click_status in _TRUE_DELIVERY_STATUSES,
+            "ok": ok,
             "status": final_status,
             "error": _lift_error(
-                ok and click_status in _TRUE_DELIVERY_STATUSES,
+                ok,
                 click_result,
-                mark_result,
+                mark_result or {},
             ),
             "click_result": click_result,
             "mark_result": mark_result,
         }
+
+    @staticmethod
+    def _is_manual_required_item(item: Mapping[str, Any]) -> bool:
+        action = str(item.get("action") or "").strip().lower()
+        if action == ChatAction.ESCALATE.value:
+            return True
+        actionable = {
+            ChatAction.REPLY.value,
+            ChatAction.SEND_RESUME.value,
+            ChatAction.ACCEPT_CARD.value,
+            ChatAction.REJECT_CARD.value,
+        }
+        if action not in actionable:
+            return False
+        if bool(item.get("auto_executed")):
+            return False
+        execution = item.get("execution")
+        if not isinstance(execution, Mapping):
+            return True
+        if execution.get("ok") is False:
+            return True
+        status = str(execution.get("status") or "").strip().lower()
+        return status in {
+            "pending_confirmation",
+            "manual_required",
+            "suspended",
+            "denied",
+            "failed",
+        }
+
+    def _build_process_action_report(
+        self,
+        *,
+        items: list[dict[str, Any]],
+        source: str,
+        chat_tab: str,
+        auto_execute: bool,
+        confirm_execute: bool,
+        errors: list[str],
+    ) -> ActionReport:
+        processed_total = len(items)
+        auto_executed_total = sum(1 for item in items if bool(item.get("auto_executed")))
+        escalated_total = sum(
+            1
+            for item in items
+            if str(item.get("action") or "").strip().lower() == ChatAction.ESCALATE.value
+        )
+        ignored_total = sum(
+            1
+            for item in items
+            if str(item.get("action") or "").strip().lower() == ChatAction.IGNORE.value
+        )
+
+        details: list[ActionDetail] = []
+        manual_required_total = 0
+        for item in items:
+            action = str(item.get("action") or "").strip().lower()
+            execution = item.get("execution")
+            execution_map = execution if isinstance(execution, Mapping) else None
+            execution_status = (
+                str(execution_map.get("status") or "").strip().lower()
+                if execution_map is not None
+                else ""
+            )
+            manual_required = self._is_manual_required_item(item)
+            if manual_required:
+                detail_status = "failed"
+                manual_required_total += 1
+            elif bool(item.get("auto_executed")):
+                detail_status = "succeeded"
+            else:
+                detail_status = "skipped"
+
+            reason_parts: list[str] = []
+            plan_reason = str(item.get("reason") or "").strip()
+            if manual_required:
+                reason_parts.append("需要人工处理")
+            if execution_status:
+                reason_parts.append(f"status={execution_status}")
+            if plan_reason:
+                reason_parts.append(plan_reason)
+            reason = "；".join(reason_parts)[:300] or "no_reason"
+
+            conversation_id = str(item.get("conversation_id") or "").strip()
+            url = _safe_chat_url(item.get("conversation_url"))
+            if not url and execution_map is not None:
+                url = _extract_execution_url(execution_map)
+            if not url and manual_required:
+                url = _fallback_conversation_url(conversation_id)
+
+            company = str(item.get("company") or "").strip()
+            job_title = str(item.get("job_title") or "").strip()
+            hr_name = str(item.get("hr_name") or "").strip()
+            conversation_title = str(item.get("conversation_title") or "").strip()
+            if not conversation_title:
+                title_parts = [part for part in (hr_name, company, job_title) if part]
+                conversation_title = " / ".join(title_parts)
+            card_title = str(item.get("card_title") or "").strip()
+            target = conversation_title[:180] or f"conversation:{conversation_id or '-'}"
+            if card_title and card_title not in target:
+                target = f"{target} | 卡片: {card_title[:80]}"
+            details.append(
+                ActionDetail(
+                    target=target,
+                    status=detail_status,
+                    reason=reason,
+                    url=url or None,
+                    extras={
+                        "conversation_id": conversation_id,
+                        "conversation_id_source": str(
+                            item.get("conversation_id_source") or "row"
+                        ),
+                        "conversation_title": conversation_title[:240],
+                        "card_title": card_title[:160],
+                        "action": action or "unknown",
+                        "manual_required": manual_required,
+                        "execution_status": execution_status or "-",
+                    },
+                )
+            )
+
+        if processed_total == 0:
+            summary = "已检查未读消息，当前没有需要处理的新会话。"
+            report_status: str | None = "skipped"
+        elif manual_required_total > 0:
+            summary = (
+                f"已检查 {processed_total} 条未读，自动处理 {auto_executed_total} 条；"
+                f"另有 {manual_required_total} 条需要你人工处理（已附会话链接，避免漏消息）。"
+            )
+            report_status = None
+        elif auto_executed_total > 0:
+            summary = f"已检查 {processed_total} 条未读，已自动处理 {auto_executed_total} 条。"
+            report_status = None
+        else:
+            summary = f"已检查 {processed_total} 条未读，本轮没有可自动处理的会话。"
+            report_status = None
+
+        next_steps: list[str] = []
+        if manual_required_total > 0:
+            next_steps.append("请按会话链接逐条处理，避免未读在平台自动变更后漏消息。")
+        metrics = {
+            "processed": processed_total,
+            "auto_executed": auto_executed_total,
+            "manual_required": manual_required_total,
+            "escalated": escalated_total,
+            "ignored": ignored_total,
+            "errors": len(errors),
+        }
+        return ActionReport.build(
+            action="job.chat",
+            summary=summary,
+            details=details,
+            status=report_status,
+            metrics=metrics,
+            next_steps=next_steps,
+            evidence={
+                "source": source,
+                "chat_tab": chat_tab,
+                "auto_execute": bool(auto_execute),
+                "confirm_execute": bool(confirm_execute),
+            },
+        )
 
     def _maybe_execute_planned(
         self,
@@ -1438,6 +1719,25 @@ class JobChatService:
             logger.warning("chat: JobMemory.snapshot() failed: %s", exc)
             return None
 
+    @staticmethod
+    def _resolve_reply_persona(snapshot: JobMemorySnapshot | None) -> str:
+        if snapshot is None:
+            return "INTJ"
+        facts = snapshot.user_facts if isinstance(snapshot.user_facts, dict) else {}
+        preferred_keys = (
+            "pref.job_chat_persona",
+            "pref.reply_persona",
+            "pref.persona",
+            "pref.mbti",
+            "user.mbti",
+            "user.personality",
+        )
+        for key in preferred_keys:
+            value = str(facts.get(key) or "").strip()
+            if value:
+                return value[:40]
+        return "INTJ"
+
     def _ensure_reply_text(
         self,
         plan: PlannedChatAction,
@@ -1467,6 +1767,7 @@ class JobChatService:
                 hr_message=str(conversation.get("latest_message") or ""),
                 conversation=conversation,
                 snapshot=snapshot,
+                persona_hint=self._resolve_reply_persona(snapshot),
             )
         except (RuntimeError, ValueError, TypeError) as exc:  # pragma: no cover
             logger.warning("chat replier failed, keep planner output: %s", exc)

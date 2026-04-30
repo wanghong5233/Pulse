@@ -35,7 +35,9 @@ from .._connectors.base import JobPlatformConnector
 from ..memory import HardConstraints, JobMemory, JobMemorySnapshot
 from .greeter import JobGreeter
 from .matcher import JobSnapshotMatcher, MatchResult
+from .reflection import ReflectionPlanner, RoundSummary
 from .repository import GreetRepository
+from .trait_expander import TraitCompanyExpander
 
 logger = logging.getLogger(__name__)
 
@@ -54,16 +56,32 @@ _UNAVAILABLE_STATUSES: frozenset[str] = frozenset({
     "mode_not_configured", "manual_required", "dry_run",
 })
 
+# Verdicts that qualify a JD to enter the candidate pool. Filtering is
+# verdict-membership based (ordinal LLM-as-Judge), not score-threshold
+# based — see matcher.py module docstring for the rationale.
+_SHORTLIST_VERDICTS: frozenset[str] = frozenset({"good", "okay"})
+
+# Reflection budget when the candidate pool is empty after the first
+# scan+match pass. Hard constraints (city / experience_level / salary
+# floor / avoid_trait) are NEVER relaxed; only the search keyword is
+# evolved by the LLM, with the previous round's skip reasons fed back
+# in. Two extra rounds is the documented industry sweet spot for
+# Reflexion-style loops on browser-scraped corpora — past round 3 the
+# scan returns near-duplicates and quality plateaus.
+_REFLECTION_MAX_ROUNDS: int = 2
+
 
 def _build_trigger_action_report(
     *,
-    outcome: Literal["scan_miss", "not_ready", "preview", "run"],
+    outcome: Literal["scan_miss", "not_ready", "quota_reached", "preview", "run"],
     reason: str | None = None,
     matched_details: list[dict[str, Any]] | None = None,
     preview_candidate_count: int = 0,
     greeted_count: int = 0,
     failed_count: int = 0,
     unavailable_count: int = 0,
+    daily_count: int = 0,
+    daily_limit: int = 0,
     source: str | None = None,
     trace_id: str = "",
 ) -> ActionReport:
@@ -101,6 +119,31 @@ def _build_trigger_action_report(
                 "failed": 0,
                 "unavailable": 0,
             },
+            evidence=evidence,
+        )
+
+    if outcome == "quota_reached":
+        safe_limit = max(1, int(daily_limit))
+        safe_count = max(0, int(daily_count))
+        return ActionReport.build(
+            action="job.greet",
+            status="skipped",
+            summary=(
+                str(reason)
+                if reason
+                else f"今日投递配额已满 ({safe_count}/{safe_limit}), 本轮未执行投递"
+            ),
+            metrics={
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+                "unavailable": 0,
+                "daily_count": safe_count,
+                "daily_limit": safe_limit,
+            },
+            next_steps=(
+                "可明日继续投递, 或调整每日投递上限后重试",
+            ),
             evidence=evidence,
         )
 
@@ -204,6 +247,43 @@ _EXP_LEVEL_ALIASES: dict[str, str] = {
     "资深": "senior",
 }
 
+_INTERN_HINT_KEYWORDS: tuple[str, ...] = (
+    "实习",
+    "intern",
+    "internship",
+    "应届",
+    "校招",
+)
+_FULL_TIME_STRONG_HINT_KEYWORDS: tuple[str, ...] = (
+    "工程师",
+    "全职",
+    "社招",
+    "资深",
+    "专家",
+    "架构师",
+    "负责人",
+    "经理",
+    "总监",
+    "leader",
+)
+_DAILY_SALARY_HINT_KEYWORDS: tuple[str, ...] = (
+    "日薪",
+    "/天",
+    "／天",
+    "元/天",
+    "元／天",
+    "每天",
+)
+_MONTHLY_SALARY_HINT_KEYWORDS: tuple[str, ...] = (
+    "/月",
+    "／月",
+    "月薪",
+    "k/月",
+    "k／月",
+    "万/月",
+    "万／月",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class FilterPipelineResult:
@@ -283,6 +363,8 @@ class JobGreetService:
         preferences: JobMemory | None = None,
         matcher: JobSnapshotMatcher | None = None,
         greeter: JobGreeter | None = None,
+        trait_expander: TraitCompanyExpander | None = None,
+        reflection_planner: ReflectionPlanner | None = None,
     ) -> None:
         self._connector = connector
         self._repository = repository
@@ -292,6 +374,8 @@ class JobGreetService:
         self._preferences = preferences
         self._matcher = matcher
         self._greeter = greeter
+        self._trait_expander = trait_expander
+        self._reflection_planner = reflection_planner
         # Contract B Phase 2: per-service, in-process cache. Python dict
         # insertion order gives us FIFO eviction for free; LRU is
         # overkill here (handles burn within one agent loop).
@@ -357,6 +441,9 @@ class JobGreetService:
         keyword: str,
         max_items: int,
         max_pages: int,
+        target_count: int | None = None,
+        evaluation_cap: int | None = None,
+        scroll_plateau_rounds: int | None = None,
         job_type: str = "all",
         fetch_detail: bool = False,
         trace_id: str | None = None,
@@ -389,6 +476,9 @@ class JobGreetService:
                 "keyword": keyword,
                 "max_items": max_items,
                 "max_pages": max_pages,
+                "target_count": target_count,
+                "evaluation_cap": evaluation_cap,
+                "scroll_plateau_rounds": scroll_plateau_rounds,
                 "job_type": job_type,
                 "fetch_detail": fetch_detail,
                 "apply_filters": apply_filters,
@@ -396,11 +486,14 @@ class JobGreetService:
             },
         )
         try:
-            normalized, errors, pages_scanned, scan_source = self._scan_cities(
+            normalized, errors, pages_scanned, scan_scroll_count, scan_source, exhausted_all = self._scan_cities(
                 keyword=keyword,
                 cities=preferred_cities,
                 max_items=max_items,
                 max_pages=max_pages,
+                target_count=target_count,
+                evaluation_cap=evaluation_cap,
+                scroll_plateau_rounds=scroll_plateau_rounds,
                 job_type=job_type,
                 fetch_detail=fetch_detail,
             )
@@ -441,6 +534,8 @@ class JobGreetService:
                 "keyword": keyword,
                 "total": len(normalized),
                 "pages_scanned": int(pages_scanned or 1),
+                "scroll_count": int(scan_scroll_count or 0),
+                "exhausted": bool(exhausted_all),
                 "screenshot_path": None,
                 "items": normalized,
                 "source": str(scan_source or self._connector.provider_name),
@@ -478,6 +573,8 @@ class JobGreetService:
                 "keyword": keyword,
                 "total": int(result["total"]),
                 "pages_scanned": int(result["pages_scanned"]),
+                "scroll_count": int(result.get("scroll_count") or 0),
+                "exhausted": bool(result.get("exhausted")),
                 "source": result["source"],
                 "errors_total": len(result["errors"]),
                 "filters_applied": bool(apply_filters),
@@ -599,6 +696,52 @@ class JobGreetService:
             }
 
         try:
+            daily_limit = max(1, int(self._policy.daily_limit))
+            greeted_today = self._repository.today_greeted_urls()
+            remaining_quota = max(0, daily_limit - len(greeted_today))
+            if remaining_quota <= 0:
+                reason = (
+                    f"daily_limit_reached: 今日投递配额已满 ({len(greeted_today)}/{daily_limit}), "
+                    "本轮未执行投递"
+                )
+                self._emit(
+                    stage="trigger",
+                    status="quota_reached",
+                    trace_id=trace_id,
+                    payload={
+                        "keyword": effective_keyword,
+                        "daily_count": len(greeted_today),
+                        "daily_limit": daily_limit,
+                    },
+                )
+                return {
+                    "ok": True,
+                    "trace_id": trace_id,
+                    "keyword": effective_keyword,
+                    "requested_keyword": requested_keyword,
+                    "needs_confirmation": False,
+                    "execution_ready": self._connector.execution_ready,
+                    "greeted": 0,
+                    "failed": 0,
+                    "unavailable": 0,
+                    "skipped": 0,
+                    "daily_count": len(greeted_today),
+                    "daily_limit": daily_limit,
+                    "reason": reason,
+                    "pages_scanned": 0,
+                    "matched_details": [],
+                    "source": self._connector.provider_name,
+                    "provider": self._connector.provider_name,
+                    "errors": [reason],
+                    ACTION_REPORT_KEY: _build_trigger_action_report(
+                        outcome="quota_reached",
+                        reason=reason,
+                        daily_count=len(greeted_today),
+                        daily_limit=daily_limit,
+                        source=self._connector.provider_name,
+                        trace_id=trace_id or "",
+                    ).to_dict(),
+                }
             if reused_scan is not None:
                 scan = reused_scan
                 logger.info(
@@ -608,18 +751,23 @@ class JobGreetService:
                     len(scan.get("items") or []),
                 )
             else:
-                # scan 侧不再重复应用过滤(F7): trigger 自己按 pref/hc/dedup 三段
-                # 分别 emit 事件, 保持细粒度审计可见性.
+                # Streaming scroll: ask scan to fill an evaluation pool deep
+                # enough to feed two-stage matching. Stage-A operates on
+                # metadata only; detail-fetches are deferred to stage-B over
+                # the list-stage shortlist, so scan stays pure-list here.
+                # batch_size * 6 gives stage-A room for ~70% drop rate
+                # (typical on BOSS) and still hits the ``evaluation_cap``
+                # ceiling well before the absolute scroll cap.
+                safe_batch_for_scan = self._clamp_batch_size(batch_size)
                 scan = self._run_trigger_scan(
                     keywords=effective_keywords,
-                    max_items=30,
-                    max_pages=3,
+                    target_count=max(20, safe_batch_for_scan * 6),
+                    evaluation_cap=120,
+                    scroll_plateau_rounds=3,
                     job_type=job_type,
-                    fetch_detail=fetch_detail,
+                    fetch_detail=False,
                     trace_id=trace_id,
                 )
-            daily_limit = max(1, int(self._policy.daily_limit))
-            greeted_today = self._repository.today_greeted_urls()
             if not self._connector.execution_ready:
                 source = str(scan.get("source") or self._connector.provider_name)
                 provider = str(scan.get("provider") or self._connector.provider_name)
@@ -697,16 +845,134 @@ class JobGreetService:
                 },
             )
 
-            scored_items = self._score_items(
-                pipeline.kept, snapshot=snapshot, keyword=effective_keyword
+            target_pool_size = min(safe_batch_size, remaining_quota)
+            # ``threshold`` is retained in the request for back-compat but
+            # no longer gates inclusion. We still log it so audit can see
+            # whether a caller is shipping a stale threshold value.
+            _ = threshold
+
+            # ── Stage A — list-only matcher ───────────────────────────
+            # Run the LLM-as-Judge over scan metadata (title/company/
+            # salary/snippet). Cheap; cuts ~70% obvious misses without
+            # paying detail-page cost.
+            initial_skipped_audit: list[dict[str, Any]] = []
+            list_shortlist = self._score_items(
+                pipeline.kept,
+                snapshot=snapshot,
+                keyword=effective_keyword,
+                errors=errors,
+                trace_id=trace_id,
+                skipped_audit=initial_skipped_audit,
+                stage_label="list",
             )
 
-            matched = [item for item in scored_items if float(item.get("match_score") or 0.0) >= threshold]
-            # 按 LLM 打分降序排; 保留稳定顺序作 tie-break (原始 list 顺序)。
-            matched.sort(key=lambda row: float(row.get("match_score") or 0.0), reverse=True)
+            # ── Stage B — detail-aware refinement ─────────────────────
+            # Only stage-A survivors pay fetch_job_detail cost. Stage-B
+            # re-scores with the JD body included; matcher prompt
+            # auto-deepens when row['detail'] is populated.
+            if fetch_detail:
+                matched = self._refine_with_detail(
+                    list_shortlist,
+                    snapshot=snapshot,
+                    keyword=effective_keyword,
+                    errors=errors,
+                    trace_id=trace_id,
+                    target_count=target_pool_size,
+                )
+            else:
+                matched = list_shortlist
+            self._emit(
+                stage="trigger",
+                status="two_stage_match",
+                trace_id=trace_id,
+                payload={
+                    "stage_a_kept": len(list_shortlist),
+                    "stage_b_kept": len(matched),
+                    "detail_enabled": bool(fetch_detail),
+                    "scan_exhausted": bool(scan.get("exhausted")),
+                    "scan_scroll_count": int(scan.get("scroll_count") or 0),
+                },
+            )
 
-            remaining_quota = max(0, daily_limit - len(greeted_today))
-            selected = matched[: min(safe_batch_size, remaining_quota)]
+            # ── Reflection (degraded fallback) ────────────────────────
+            # Only invoked when the source list is *truly* exhausted on
+            # the original keyword(s) AND we still don't meet target.
+            # Within the same keyword, scroll-driven scan already
+            # collected up to ``evaluation_cap`` cards; evolving keywords
+            # while there's still tail content would pollute the pool
+            # with off-target results.
+            tried_keywords: list[str] = list(effective_keywords)
+            round_history: list[RoundSummary] = [
+                RoundSummary(
+                    keyword=effective_keyword,
+                    scanned_total=len(items),
+                    shortlisted_total=len(matched),
+                    skipped_examples=initial_skipped_audit[:8],
+                )
+            ]
+            reflection_iterations = 0
+            seen_urls: set[str] = {
+                str(row.get("source_url") or "").strip()
+                for row in matched
+                if row.get("source_url")
+            }
+            scan_exhausted = bool(scan.get("exhausted"))
+            while (
+                len(matched) < target_pool_size
+                and reflection_iterations < _REFLECTION_MAX_ROUNDS
+                and self._reflection_planner is not None
+                and scan_exhausted
+            ):
+                reflection_iterations += 1
+                missing = target_pool_size - len(matched)
+                hard_md = self._render_hard_constraints_md(snapshot)
+                plan = self._reflection_planner.plan_next_keywords(
+                    original_user_intent=requested_keyword,
+                    hard_constraints_md=hard_md,
+                    round_history=round_history,
+                    target_remaining=missing,
+                    already_tried_keywords=tried_keywords,
+                )
+                self._emit(
+                    stage="trigger",
+                    status="reflection",
+                    trace_id=trace_id,
+                    payload={
+                        "iteration": reflection_iterations,
+                        "missing": missing,
+                        "next_keywords": list(plan.next_keywords),
+                        "rationale": plan.rationale,
+                        "trigger": "scan_exhausted",
+                    },
+                )
+                if not plan.next_keywords:
+                    break
+
+                next_matched, next_errors, next_summary, round_exhausted = self._collect_round(
+                    keywords=list(plan.next_keywords),
+                    snapshot=snapshot,
+                    job_type=job_type,
+                    fetch_detail=fetch_detail,
+                    trace_id=trace_id,
+                    seen_urls=seen_urls,
+                    target_count=target_pool_size - len(matched),
+                )
+                tried_keywords.extend(plan.next_keywords)
+                errors.extend(next_errors)
+                round_history.append(next_summary)
+                # Hard gate: reflection can continue only if this round's
+                # keyword space is also exhausted. Otherwise we must keep
+                # consuming the current keyword's scroll tail instead of
+                # evolving again.
+                scan_exhausted = bool(round_exhausted)
+                if next_matched:
+                    matched.extend(next_matched)
+
+            matched.sort(
+                key=lambda row: float(row.get("match_score") or 0.0),
+                reverse=True,
+            )
+            selected = matched[:target_pool_size]
             override_greeting = self._override_greeting(greeting_text)
             safe_run_id = run_id or datetime.now(timezone.utc).strftime("run-%Y%m%d%H%M%S")
 
@@ -971,46 +1237,89 @@ class JobGreetService:
             candidates = [str(role or "").strip() for role in target_roles]
         else:
             candidates = [requested or default_keyword or "AI Agent 实习"]
-        return _dedupe_nonempty(candidates)
+        keywords = _dedupe_nonempty(candidates)
+        if (
+            snapshot is not None
+            and _EXP_LEVEL_ALIASES.get(
+                str(snapshot.hard_constraints.experience_level or "").strip().lower()
+            )
+            == "intern"
+        ):
+            keywords = [self._ensure_intern_keyword(k) for k in keywords]
+        return _dedupe_nonempty(keywords)
+
+    @staticmethod
+    def _ensure_intern_keyword(keyword: str) -> str:
+        text = str(keyword or "").strip()
+        if not text:
+            return "AI Agent 实习"
+        lowered = text.lower()
+        if any(tok in lowered for tok in _INTERN_HINT_KEYWORDS):
+            return text
+        return f"{text} 实习"
 
     def _run_trigger_scan(
         self,
         *,
         keywords: list[str],
-        max_items: int,
-        max_pages: int,
+        target_count: int | None = None,
+        evaluation_cap: int | None = None,
+        scroll_plateau_rounds: int | None = None,
+        max_items: int | None = None,
+        max_pages: int | None = None,
         job_type: str,
         fetch_detail: bool,
         trace_id: str | None,
     ) -> dict[str, Any]:
-        """Scan all currently active target-role keywords for trigger mode."""
+        """Scan all currently active target-role keywords for trigger mode.
+
+        New trigger callers pass ``target_count`` / ``evaluation_cap`` /
+        ``scroll_plateau_rounds`` directly. Legacy ``max_items`` /
+        ``max_pages`` are accepted for back-compat (older patrol harnesses)
+        and projected onto the streaming-scroll knobs.
+        """
         safe_keywords = _dedupe_nonempty(keywords)
+        if target_count is None:
+            target_count = max_items if max_items is not None else 30
+        if evaluation_cap is None:
+            evaluation_cap = max(target_count, 60)
+        if scroll_plateau_rounds is None:
+            scroll_plateau_rounds = 3
+
         if len(safe_keywords) <= 1:
             keyword = safe_keywords[0] if safe_keywords else self._policy.default_keyword
             return self.run_scan(
                 keyword=keyword,
-                max_items=max_items,
-                max_pages=max_pages,
+                max_items=target_count,
+                max_pages=max_pages or scroll_plateau_rounds,
+                target_count=target_count,
+                evaluation_cap=evaluation_cap,
+                scroll_plateau_rounds=scroll_plateau_rounds,
                 job_type=job_type,
                 fetch_detail=fetch_detail,
                 trace_id=trace_id,
                 apply_filters=False,
             )
 
-        target_total = max(1, min(int(max_items), 80))
-        per_keyword = max(1, (target_total + len(safe_keywords) - 1) // len(safe_keywords))
+        per_keyword = max(1, (target_count + len(safe_keywords) - 1) // len(safe_keywords))
+        per_keyword_cap = max(per_keyword, evaluation_cap // max(1, len(safe_keywords)))
         merged_items: list[dict[str, Any]] = []
         errors: list[str] = []
         seen: set[str] = set()
         pages_scanned = 0
+        scroll_count = 0
         sources: list[str] = []
         providers: list[str] = []
+        exhausted_all = True
 
         for keyword in safe_keywords:
             scan = self.run_scan(
                 keyword=keyword,
                 max_items=per_keyword,
-                max_pages=max_pages,
+                max_pages=max_pages or scroll_plateau_rounds,
+                target_count=per_keyword,
+                evaluation_cap=per_keyword_cap,
+                scroll_plateau_rounds=scroll_plateau_rounds,
                 job_type=job_type,
                 fetch_detail=fetch_detail,
                 trace_id=trace_id,
@@ -1018,6 +1327,12 @@ class JobGreetService:
             )
             errors.extend(str(err) for err in list(scan.get("errors") or []))
             pages_scanned = max(pages_scanned, int(scan.get("pages_scanned") or 0))
+            scroll_count = max(scroll_count, int(scan.get("scroll_count") or 0))
+            # Across keywords, exhaustion is only true if every keyword's
+            # source list ran dry. If any keyword still has tail content
+            # we shouldn't trigger reflection-driven keyword evolution.
+            if not bool(scan.get("exhausted")):
+                exhausted_all = False
             source = str(scan.get("source") or "").strip()
             provider = str(scan.get("provider") or "").strip()
             if source and source not in sources:
@@ -1034,9 +1349,9 @@ class JobGreetService:
                     continue
                 seen.add(key)
                 merged_items.append(item)
-                if len(merged_items) >= target_total:
+                if len(merged_items) >= evaluation_cap:
                     break
-            if len(merged_items) >= target_total:
+            if len(merged_items) >= evaluation_cap:
                 break
 
         return {
@@ -1045,6 +1360,8 @@ class JobGreetService:
             "keywords": safe_keywords,
             "total": len(merged_items),
             "pages_scanned": max(1, pages_scanned),
+            "scroll_count": max(0, scroll_count),
+            "exhausted": exhausted_all,
             "screenshot_path": None,
             "items": merged_items,
             "source": ",".join(sources) or self._connector.provider_name,
@@ -1067,9 +1384,12 @@ class JobGreetService:
         cities: list[str],
         max_items: int,
         max_pages: int,
+        target_count: int | None = None,
+        evaluation_cap: int | None = None,
+        scroll_plateau_rounds: int | None = None,
         job_type: str,
         fetch_detail: bool,
-    ) -> tuple[list[dict[str, Any]], list[str], int, str]:
+    ) -> tuple[list[dict[str, Any]], list[str], int, int, str, bool]:
         """按 cities 列表 fan-out 调 ``connector.scan_jobs`` 并合并结果.
 
         - ``cities=[]``: 一次调用, ``city=None``;
@@ -1078,37 +1398,57 @@ class JobGreetService:
           取整, 每轮至少 1), 同 ``(job_id, source_url)`` 跨 city 去重.
 
         `fetch_detail=True` 时对每条命中再单独取详情. 返回
-        ``(items, errors, pages_scanned, source_label)``.
+        ``(items, errors, pages_scanned, scroll_count, source_label, exhausted_all)``;
+        ``exhausted_all=True`` 仅当所有 city 的源列表都报到底, 用作上层
+        reflection 兜底门控.
         """
-        target_total = max(1, min(int(max_items), 80))
+        target_total = max(1, min(int(max_items), 200))
+        if target_count is None:
+            target_count = target_total
+        if evaluation_cap is None:
+            evaluation_cap = max(target_count, 60)
+        if scroll_plateau_rounds is None:
+            scroll_plateau_rounds = 3
         city_list: list[str | None]
         if cities:
             city_list = [c for c in cities]  # type: ignore[list-item]
-            # 多城市 fan-out: 每 city 至少爬 1 条, 合并后截断到 target_total.
-            per_city = max(1, (target_total + len(city_list) - 1) // len(city_list))
+            # 多城市 fan-out: 每 city 至少爬 1 条, 合并后截断到 evaluation_cap.
+            per_city = max(1, (target_count + len(city_list) - 1) // len(city_list))
+            per_city_cap = max(per_city, evaluation_cap // len(city_list))
         else:
             city_list = [None]
-            per_city = target_total
+            per_city = target_count
+            per_city_cap = evaluation_cap
 
         merged: list[dict[str, Any]] = []
         merged_errors: list[str] = []
         seen_keys: set[str] = set()
         pages_scanned_max = 0
+        scroll_count_max = 0
         source_labels: list[str] = []
+        exhausted_all = True
 
         for city in city_list:
             scan_result = self._connector.scan_jobs(
                 keyword=keyword,
                 max_items=per_city,
                 max_pages=max_pages,
+                target_count=per_city,
+                evaluation_cap=per_city_cap,
+                scroll_plateau_rounds=scroll_plateau_rounds,
                 job_type=job_type,
                 city=city,
             )
+            if not bool(scan_result.get("exhausted")):
+                exhausted_all = False
             merged_errors.extend(
                 str(item)[:400] for item in list(scan_result.get("errors") or [])
             )
             pages_scanned_max = max(
                 pages_scanned_max, int(scan_result.get("pages_scanned") or 1)
+            )
+            scroll_count_max = max(
+                scroll_count_max, int(scan_result.get("scroll_count") or 0)
             )
             source_label = str(scan_result.get("source") or self._connector.provider_name)
             if source_label and source_label not in source_labels:
@@ -1134,13 +1474,20 @@ class JobGreetService:
                     if err:
                         merged_errors.append(err[:400])
                 merged.append(item)
-                if len(merged) >= target_total:
+                if len(merged) >= evaluation_cap:
                     break
-            if len(merged) >= target_total:
+            if len(merged) >= evaluation_cap:
                 break
 
         combined_source = ",".join(source_labels) or self._connector.provider_name
-        return merged, merged_errors, max(1, pages_scanned_max), combined_source
+        return (
+            merged,
+            merged_errors,
+            max(1, pages_scanned_max),
+            max(0, scroll_count_max),
+            combined_source,
+            exhausted_all,
+        )
 
     def _score_items(
         self,
@@ -1148,38 +1495,314 @@ class JobGreetService:
         *,
         snapshot: JobMemorySnapshot | None,
         keyword: str,
+        errors: list[str] | None = None,
+        trace_id: str | None = None,
+        skipped_audit: list[dict[str, Any]] | None = None,
+        stage_label: str = "list",
     ) -> list[dict[str, Any]]:
-        """对每条 JD 调 matcher 打分, 结果写回 item 顶层 key, 过滤 verdict=skip。
+        """Run LLM-as-Judge over every JD and emit a per-item audit event.
 
-        自动打招呼是真实外部动作, matcher 缺失或失败时不允许用关键词启发式
-        兜底进入发送候选;只跳过并记录审计原因。
+        Contract:
+
+        * The matcher is an ordinal classifier (good/okay/poor/skip).
+        * **Every** JD that reaches this method emits one
+          ``module.job_greet.match.candidate`` event so post-mortem can
+          tell "no shortlist because LLM said poor/skip" apart from
+          "no shortlist because matcher crashed silently".
+        * ``stage_label`` distinguishes list-only vs detail-aware passes
+          in the audit event so the same JD can be re-scored after
+          ``fetch_job_detail`` without ambiguity.
+        * Inclusion in the returned list is verdict-based: only ``good``
+          and ``okay`` are returned. ``poor`` / ``skip`` rows are dropped
+          here but still appear in the audit event.
+        * No heuristic fallback when the matcher is missing — auto-greet
+          is a real outbound action; degrading to keywords is worse than
+          failing loud.
         """
         if self._matcher is None:
             logger.warning("greet matcher unavailable; skip all trigger candidates")
             return []
+        shortlist_verdicts = _SHORTLIST_VERDICTS
         out: list[dict[str, Any]] = []
         for row in items:
             try:
                 result: MatchResult = self._matcher.match(
                     job=row, snapshot=snapshot, keyword=keyword
                 )
-            except (RuntimeError, ValueError, TypeError, KeyError) as exc:  # pragma: no cover
-                logger.warning("greet matcher failed; skip candidate job_id=%s err=%s", row.get("job_id"), exc)
-                continue
-            if result.verdict == "skip":
-                logger.info(
-                    "greet matcher skipped job=%s reason=%s",
+            except (RuntimeError, ValueError) as exc:
+                # Only LLM/parse-layer transient errors are absorbed here.
+                # KeyError/TypeError indicate dirty upstream payload and
+                # must fail-fast so the source can be fixed (§代码宪法 §2).
+                logger.warning(
+                    "greet matcher failed; skip candidate job_id=%s err=%s",
                     row.get("job_id"),
-                    result.reason,
+                    exc,
+                )
+                self._emit_match_candidate(
+                    trace_id=trace_id,
+                    keyword=keyword,
+                    row=row,
+                    verdict="skip",
+                    score=0.0,
+                    matched_signals=[],
+                    concerns=[],
+                    hard_violations=[],
+                    reason=f"matcher_exception:{type(exc).__name__}",
+                    shortlisted=False,
+                    stage_label=stage_label,
                 )
                 continue
+
+            verdict = str(result.verdict or "").strip().lower()
+            shortlisted = verdict in shortlist_verdicts and not result.hard_violations
+
+            self._emit_match_candidate(
+                trace_id=trace_id,
+                keyword=keyword,
+                row=row,
+                verdict=verdict,
+                score=float(result.score),
+                matched_signals=list(result.matched_signals),
+                concerns=list(result.concerns),
+                hard_violations=list(result.hard_violations),
+                reason=result.reason,
+                shortlisted=shortlisted,
+                stage_label=stage_label,
+            )
+
+            if not shortlisted:
+                if errors is not None and result.hard_violations:
+                    reason_excerpt = ";".join(result.hard_violations[:3])
+                    errors.append(
+                        f"skip:matcher_hard_violations company={row.get('company') or '?'} "
+                        f"violations={reason_excerpt}"
+                    )
+                if skipped_audit is not None:
+                    skipped_audit.append(
+                        {
+                            "company": row.get("company"),
+                            "job_title": row.get("title"),
+                            "verdict": verdict,
+                            "hard_violations": list(result.hard_violations)[:3],
+                            "reason": (result.reason or "")[:160],
+                        }
+                    )
+                continue
+
             row["match_score"] = result.score
-            row["match_verdict"] = result.verdict
+            row["match_verdict"] = verdict
             row["match_signals"] = list(result.matched_signals)
             row["match_concerns"] = list(result.concerns)
+            row["match_hard_violations"] = list(result.hard_violations)
             row["match_reason"] = result.reason
             out.append(row)
         return out
+
+    def _refine_with_detail(
+        self,
+        list_shortlist: list[dict[str, Any]],
+        *,
+        snapshot: JobMemorySnapshot | None,
+        keyword: str,
+        errors: list[str],
+        trace_id: str | None,
+        target_count: int,
+    ) -> list[dict[str, Any]]:
+        """Stage-B: fetch JD detail for top list-shortlist rows and re-score.
+
+        Stage-A matcher runs on metadata only (title/company/salary/snippet).
+        That's enough to drop obvious misses (city/salary/avoid_trait) without
+        paying detail-page cost. Survivors come here, where we pull the JD
+        body and re-run the matcher; the matcher prompt automatically
+        deepens when ``row['detail']`` is present (see ``matcher._render_job``).
+
+        ``target_count`` caps how many detail-fetches we pay for. We refine
+        a 1.5× headroom over target so detail-stage poor/skip drops still
+        leave enough survivors for outreach. List rows are pre-sorted by
+        code-side ranking so refinement spends budget on the most promising
+        candidates first.
+        """
+        if not list_shortlist or target_count <= 0:
+            return []
+        list_shortlist.sort(
+            key=lambda row: float(row.get("match_score") or 0.0),
+            reverse=True,
+        )
+        refine_budget = max(target_count, int(target_count * 1.5))
+        refine_pool = list_shortlist[:refine_budget]
+
+        enriched: list[dict[str, Any]] = []
+        for row in refine_pool:
+            detail_call = self._connector.fetch_job_detail(
+                job_id=str(row.get("job_id") or ""),
+                source_url=str(row.get("source_url") or ""),
+            )
+            detail = detail_call.get("detail") if isinstance(detail_call, dict) else None
+            if isinstance(detail, dict) and detail:
+                row["detail"] = detail
+            else:
+                err = str(detail_call.get("error") or "").strip() if isinstance(detail_call, dict) else ""
+                if err:
+                    errors.append(
+                        f"detail_fetch_failed company={row.get('company') or '?'} err={err[:160]}"
+                    )
+            enriched.append(row)
+
+        return self._score_items(
+            enriched,
+            snapshot=snapshot,
+            keyword=keyword,
+            errors=errors,
+            trace_id=trace_id,
+            skipped_audit=None,
+            stage_label="detail",
+        )
+
+    def _collect_round(
+        self,
+        *,
+        keywords: list[str],
+        snapshot: JobMemorySnapshot | None,
+        job_type: str,
+        fetch_detail: bool,
+        trace_id: str | None,
+        seen_urls: set[str],
+        target_count: int = 5,
+    ) -> tuple[list[dict[str, Any]], list[str], RoundSummary, bool]:
+        """One additional scan + two-stage match round driven by reflection.
+
+        Mirrors the trigger main path: streaming-scroll scan → list-stage
+        matcher → detail-stage refinement. Cross-round dedup is handled
+        here via ``seen_urls`` — never return an item whose ``source_url``
+        was already shortlisted by an earlier round, even if it survives
+        all filters again. The set is mutated in-place so the caller's
+        view stays in sync.
+        ``fetch_detail`` only controls whether stage-B detail refinement is
+        enabled. Regardless of the flag, scan itself stays list-only; detail
+        fetch (when enabled) runs over stage-A survivors only.
+
+        Returns ``round_exhausted`` as the 4th tuple item so caller can
+        enforce the hard invariant: keyword evolution is allowed only after
+        the current keyword space is confirmed exhausted.
+        """
+        round_items_target = max(target_count, 20)
+        scan = self._run_trigger_scan(
+            keywords=keywords,
+            target_count=max(round_items_target, target_count * 6),
+            evaluation_cap=120,
+            scroll_plateau_rounds=3,
+            job_type=job_type,
+            fetch_detail=False,
+            trace_id=trace_id,
+        )
+        round_items = list(scan.get("items") or [])
+        round_errors: list[str] = list(scan.get("errors") or [])
+
+        pipeline = self._apply_filter_pipeline(round_items, snapshot=snapshot)
+        round_errors.extend(pipeline.pref_reasons)
+        round_errors.extend(pipeline.hc_reasons)
+        round_errors.extend(pipeline.dedup_reasons)
+
+        kept_after_seen = [
+            row for row in pipeline.kept
+            if str(row.get("source_url") or "").strip() not in seen_urls
+        ]
+        skipped_audit: list[dict[str, Any]] = []
+        primary_keyword = keywords[0] if keywords else ""
+        list_shortlist = self._score_items(
+            kept_after_seen,
+            snapshot=snapshot,
+            keyword=primary_keyword,
+            errors=round_errors,
+            trace_id=trace_id,
+            skipped_audit=skipped_audit,
+            stage_label="list",
+        )
+        if fetch_detail:
+            scored = self._refine_with_detail(
+                list_shortlist,
+                snapshot=snapshot,
+                keyword=primary_keyword,
+                errors=round_errors,
+                trace_id=trace_id,
+                target_count=target_count,
+            )
+        else:
+            scored = list_shortlist
+        for row in scored:
+            url = str(row.get("source_url") or "").strip()
+            if url:
+                seen_urls.add(url)
+        summary = RoundSummary(
+            keyword=primary_keyword,
+            scanned_total=len(round_items),
+            shortlisted_total=len(scored),
+            skipped_examples=skipped_audit[:8],
+        )
+        return scored, round_errors, summary, bool(scan.get("exhausted"))
+
+    @staticmethod
+    def _render_hard_constraints_md(snapshot: JobMemorySnapshot | None) -> str:
+        """Compact, LLM-readable view of hard constraints for the planner.
+
+        Reuses the snapshot's prompt section but trims preference items
+        the planner doesn't need (it already gets skip reasons separately).
+        Empty snapshot returns an explicit '(none set)' so the LLM cannot
+        confuse "no constraints" with "constraints withheld".
+        """
+        if snapshot is None:
+            return "(none set)"
+        return snapshot.to_prompt_section()
+
+    def _emit_match_candidate(
+        self,
+        *,
+        trace_id: str | None,
+        keyword: str,
+        row: dict[str, Any],
+        verdict: str,
+        score: float,
+        matched_signals: list[str],
+        concerns: list[str],
+        hard_violations: list[str],
+        reason: str,
+        shortlisted: bool,
+        stage_label: str = "list",
+    ) -> None:
+        """Emit one structured per-JD match audit event.
+
+        We deliberately keep the payload small (no full snippet/detail
+        bodies) — the goal is offline triage of "why was this JD skipped",
+        not full JD replay. ``source_url`` lets a human re-open the
+        original JD if they want to challenge the LLM's verdict.
+
+        ``stage_label`` distinguishes list-only vs detail-aware verdicts
+        for the same JD: the same source_url can appear twice with
+        different verdicts when stage-A skipped on metadata and stage-B
+        re-evaluated after ``fetch_job_detail``.
+        """
+        self._emit(
+            stage="match",
+            status="candidate",
+            trace_id=trace_id,
+            payload={
+                "keyword": keyword,
+                "match_stage": stage_label,
+                "job_id": row.get("job_id"),
+                "company": row.get("company"),
+                "job_title": row.get("title"),
+                "city": row.get("city"),
+                "salary": row.get("salary"),
+                "source_url": row.get("source_url"),
+                "verdict": verdict,
+                "score": round(float(score), 1),
+                "shortlisted": bool(shortlisted),
+                "hard_violations": hard_violations[:6],
+                "matched_signals": matched_signals[:6],
+                "concerns": concerns[:6],
+                "reason": (reason or "")[:240],
+            },
+        )
 
     def _compose_greeting(
         self,
@@ -1224,11 +1847,15 @@ class JobGreetService:
             score = 0.0
         signals = [str(s) for s in (job.get("match_signals") or []) if str(s).strip()]
         concerns = [str(s) for s in (job.get("match_concerns") or []) if str(s).strip()]
+        hard_violations = [
+            str(s) for s in (job.get("match_hard_violations") or []) if str(s).strip()
+        ]
         return MatchResult(
             score=score,
             verdict=verdict,
             matched_signals=signals,
             concerns=concerns,
+            hard_violations=hard_violations,
             reason=str(job.get("match_reason") or ""),
         )
 
@@ -1282,14 +1909,20 @@ class JobGreetService:
         *,
         snapshot: JobMemorySnapshot | None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        """按 snapshot 中的黑名单 (avoid_company / avoid_trait) 过滤。
+        """按 snapshot 中的黑名单过滤。
 
         返回 ``(kept, reasons)`` — reasons 是 audit 级的 skip 原因串,
         调用方会把它拼进 result.errors 供观测。没有 snapshot (== 没配 JobMemory /
         数据库不可用) 直接透传, 不做任何过滤。
+
+        过滤顺序:
+          1) ``avoid_company`` 字面公司名命中
+          2) ``avoid_trait`` 展开后的公司集合命中 (TraitCompanyExpander + cache)
+          3) 标题/snippet 中命中 avoid_trait/avoid_keyword 目标词 (字面子串)
         """
         if snapshot is None:
             return list(items), []
+        trait_company_lookup = self._resolve_avoid_trait_company_lookup(snapshot)
         kept: list[dict[str, Any]] = []
         reasons: list[str] = []
         for item in items:
@@ -1302,6 +1935,14 @@ class JobGreetService:
                     f"skip:company_avoided company={company} reason={avoid_reason or '-'}"
                 )
                 continue
+            if company:
+                trait_hits = trait_company_lookup.get(company.casefold())
+                if trait_hits:
+                    traits = ",".join(sorted(trait_hits))
+                    reasons.append(
+                        f"skip:avoid_trait_company_set company={company} traits={traits}"
+                    )
+                    continue
             haystack = f"{title}\n{snippet}"
             hit, which = snapshot.find_avoided_target_in(haystack)
             if hit:
@@ -1311,6 +1952,30 @@ class JobGreetService:
         if reasons:
             logger.info("greet preference filter dropped %d items", len(reasons))
         return kept, reasons
+
+    def _resolve_avoid_trait_company_lookup(
+        self,
+        snapshot: JobMemorySnapshot,
+    ) -> dict[str, set[str]]:
+        expander = self._trait_expander
+        if expander is None:
+            return {}
+        try:
+            expanded = expander.resolve_avoid_trait_companies(snapshot=snapshot)
+        except (RuntimeError, ValueError, TypeError) as exc:
+            raise RuntimeError(f"trait company expansion failed: {exc}") from exc
+        lookup: dict[str, set[str]] = {}
+        for trait, companies in expanded.items():
+            trait_name = str(trait or "").strip()
+            if not trait_name:
+                continue
+            for company in companies:
+                clean_company = str(company or "").strip()
+                if not clean_company:
+                    continue
+                marker = clean_company.casefold()
+                lookup.setdefault(marker, set()).add(trait_name)
+        return lookup
 
     def _apply_hard_constraints(
         self,
@@ -1384,17 +2049,56 @@ class JobGreetService:
                     f"floor={hc.salary_floor_monthly}K"
                 )
 
-        # 3) experience_level: 仅看 detail.experience_level 结构字段
+        # 3) experience_level: 先看结构字段, 缺失时允许用 title/snippet 强信号兜底
         if hc.experience_level:
             hc_level = _EXP_LEVEL_ALIASES.get(hc.experience_level.strip().lower())
             jd_level_raw = detail.get("experience_level") or detail.get("exp_level")
+            jd_level = None
             if hc_level and jd_level_raw:
                 jd_level = _EXP_LEVEL_ALIASES.get(str(jd_level_raw).strip().lower())
+            if hc_level and jd_level is None:
+                jd_level = self._infer_experience_level_from_text(
+                    str(item.get("title") or ""),
+                    str(item.get("job_title") or ""),
+                    str(item.get("snippet") or ""),
+                )
+            if hc_level and jd_level is None:
+                jd_level = self._infer_experience_level_from_salary_text(
+                    str(item.get("salary") or ""),
+                )
+            if hc_level and jd_level:
                 if jd_level and jd_level != hc_level:
                     return (
                         f"skip:hc_experience_level company={company or '?'} "
                         f"hc={hc_level} jd={jd_level}"
                     )
+        return None
+
+    @staticmethod
+    def _infer_experience_level_from_text(*texts: str) -> str | None:
+        merged = " ".join(str(t or "").strip().lower() for t in texts if str(t or "").strip())
+        if not merged:
+            return None
+        if any(tok in merged for tok in _INTERN_HINT_KEYWORDS):
+            return "intern"
+        if any(tok in merged for tok in _FULL_TIME_STRONG_HINT_KEYWORDS):
+            return "full_time"
+        return None
+
+    @staticmethod
+    def _infer_experience_level_from_salary_text(salary_text: str) -> str | None:
+        raw = str(salary_text or "").strip()
+        if not raw:
+            return None
+        lowered = raw.lower()
+        if any(tok in lowered for tok in _DAILY_SALARY_HINT_KEYWORDS):
+            return "intern"
+        if any(tok in lowered for tok in _MONTHLY_SALARY_HINT_KEYWORDS):
+            return "full_time"
+        if re.search(r"\b\d+(?:\.\d+)?\s*[-~至]\s*\d+(?:\.\d+)?\s*[kw]\b", lowered):
+            return "full_time"
+        if re.search(r"\b\d+(?:\.\d+)?\s*[kw]\b", lowered):
+            return "full_time"
         return None
 
     # ------------------------------------------------------------------ dedup

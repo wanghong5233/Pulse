@@ -278,21 +278,51 @@ class BossPlatformConnector(JobPlatformConnector):
         self,
         *,
         keyword: str,
-        max_items: int,
-        max_pages: int,
+        max_items: int | None = None,
+        max_pages: int | None = None,
+        target_count: int | None = None,
+        evaluation_cap: int | None = None,
+        scroll_plateau_rounds: int | None = None,
         job_type: str = "all",
         city: str | None = None,
     ) -> dict[str, Any]:
+        """Scan jobs from BOSS via streaming-scroll (preferred) or fallbacks.
+
+        New parameters override the legacy ``max_items`` / ``max_pages``
+        sizing. The remote runtime treats them as the source of truth; old
+        params survive only as deprecated aliases for back-compat with
+        patrol callers that haven't been migrated yet.
+        """
         safe_keyword = str(keyword or "").strip() or "AI Agent 实习"
-        safe_items = max(1, min(int(max_items), 80))
-        safe_pages = max(1, min(int(max_pages), 8))
+        legacy_items = max(1, min(int(max_items), 200)) if max_items is not None else None
+        safe_target = (
+            max(1, min(int(target_count), 200))
+            if target_count is not None
+            else (legacy_items if legacy_items is not None else 10)
+        )
+        legacy_pages = max(1, min(int(max_pages), 8)) if max_pages is not None else None
+        safe_cap = (
+            max(safe_target, min(int(evaluation_cap), 200))
+            if evaluation_cap is not None
+            else max(safe_target, 60)
+        )
+        safe_plateau = (
+            max(1, min(int(scroll_plateau_rounds), 8))
+            if scroll_plateau_rounds is not None
+            else 3
+        )
         safe_city = (str(city).strip() or None) if city else None
         payload: dict[str, Any] = {
             "keyword": safe_keyword,
-            "max_items": safe_items,
-            "max_pages": safe_pages,
+            "target_count": safe_target,
+            "evaluation_cap": safe_cap,
+            "scroll_plateau_rounds": safe_plateau,
             "job_type": str(job_type or "all").strip() or "all",
         }
+        if legacy_items is not None:
+            payload["max_items"] = legacy_items
+        if legacy_pages is not None:
+            payload["max_pages"] = legacy_pages
         if safe_city:
             # Downstream MCP/OpenAPI handlers treat an absent ``city`` as
             # nationwide scan; only pass it when the business layer explicitly
@@ -318,6 +348,8 @@ class BossPlatformConnector(JobPlatformConnector):
             "ok": False,
             "items": [],
             "pages_scanned": 1,
+            "scroll_count": 0,
+            "exhausted": False,
             "source": self.provider_name,
             "errors": [self._degraded_reason or "provider is not execution-ready"],
             "attempts": 0,
@@ -726,7 +758,12 @@ class BossPlatformConnector(JobPlatformConnector):
 
     def _scan_with_web_search(self, payload: dict[str, Any]) -> dict[str, Any]:
         safe_keyword = str(payload.get("keyword") or "").strip() or "AI Agent 实习"
-        safe_items = max(1, min(int(payload.get("max_items") or 10), 80))
+        # Web-search fallback has no scrolling; map target/cap onto the
+        # legacy items/pages knobs as a one-shot best-effort.
+        safe_items = max(
+            1,
+            min(int(payload.get("evaluation_cap") or payload.get("max_items") or 10), 80),
+        )
         safe_pages = max(1, min(int(payload.get("max_pages") or 3), 8))
         query_pool = (
             f"site:zhipin.com {safe_keyword} 实习",
@@ -801,6 +838,11 @@ class BossPlatformConnector(JobPlatformConnector):
             "ok": bool(rows),
             "items": rows[:safe_items],
             "pages_scanned": max(1, pages_scanned),
+            "scroll_count": 0,
+            # Web-search has no notion of "load more"; treat the response as
+            # the only batch this provider can yield so reflection can
+            # decide whether to evolve keywords.
+            "exhausted": True,
             "source": source,
             "errors": errors,
             "attempts": 1,
@@ -814,20 +856,24 @@ class BossPlatformConnector(JobPlatformConnector):
                 "ok": False,
                 "items": [],
                 "pages_scanned": 1,
+                "scroll_count": 0,
+                "exhausted": False,
                 "source": default_source,
                 "errors": [str(call.error or "scan failed")[:400]],
                 "attempts": call.attempts,
             }
-        body = call.result
+        body = call.result if isinstance(call.result, dict) else {}
         items = _extract_items(body)
-        pages_scanned = 1
-        if isinstance(body, dict):
-            pages_scanned = max(1, int(body.get("pages_scanned") or body.get("pages") or 1))
+        pages_scanned = max(1, int(body.get("pages_scanned") or body.get("pages") or 1))
+        scroll_count = int(body.get("scroll_count") or 0)
+        exhausted = bool(body.get("exhausted"))
         return {
             "ok": True,
             "items": items,
             "pages_scanned": pages_scanned,
-            "source": str((body or {}).get("source") if isinstance(body, dict) else "") or default_source,
+            "scroll_count": max(0, scroll_count),
+            "exhausted": exhausted,
+            "source": str(body.get("source") or "") or default_source,
             "errors": _extract_errors(body),
             "attempts": call.attempts,
         }

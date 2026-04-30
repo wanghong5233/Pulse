@@ -389,6 +389,7 @@ Runtime 发射的**通用事件**（不含任何业务模块名称）：
 | `runtime.patrol.lifecycle.enabled` | `enable_patrol` 成功 (ADR-004 §6.1, ✅) | `{task_name}` |
 | `runtime.patrol.lifecycle.disabled` | `disable_patrol` 成功 (ADR-004 §6.1, ✅) | `{task_name}` |
 | `runtime.patrol.lifecycle.triggered` | `run_patrol_once` 进入 `_execute_patrol` 前 (ADR-004 §6.1, ✅) | `{task_name}` |
+| `runtime.patrols.disarmed` | `disarm_patrols` 完成后 (停机前安全去武装) | `{disabled[], already_disabled[], failed[]}` |
 
 ### 5.5 API 控制面
 
@@ -396,7 +397,7 @@ Runtime 发射的**通用事件**（不含任何业务模块名称）：
 |------|------|------|
 | GET | `/api/runtime/status` | 运行状态、所有任务列表、统计 |
 | POST | `/api/runtime/start` | 手动启动 |
-| POST | `/api/runtime/stop` | 手动停止 |
+| POST | `/api/runtime/stop` | 手动停机。默认先 `disarm_patrols=true` 去武装全部 patrol，再 stop runtime；可显式传 `disarm_patrols=false` 仅停 runtime |
 | POST | `/api/runtime/trigger` | 手动触发一次心跳 |
 | POST | `/api/runtime/reset/{task}` | 重置某任务的熔断器 |
 | GET | `/api/runtime/patrols` | 列出所有已注册 patrol(排除内部心跳) (ADR-004 §6.1, ✅) |
@@ -404,6 +405,15 @@ Runtime 发射的**通用事件**（不含任何业务模块名称）：
 | POST | `/api/runtime/patrols/{name}/enable` | 开启某条 patrol (ADR-004 §6.1, ✅) |
 | POST | `/api/runtime/patrols/{name}/disable` | 关闭某条 patrol (ADR-004 §6.1, ✅) |
 | POST | `/api/runtime/patrols/{name}/trigger` | 立即跑一次 patrol (ADR-004 §6.1, ✅) |
+
+`stop` 与 `disable` 的职责边界:
+
+| 维度 | `system.patrol.disable(name)` | `/api/runtime/stop` |
+|---|---|---|
+| 控制对象 | 单条 patrol | runtime + 全部 patrol |
+| 是否停进程 | 否 | 是 |
+| 默认副作用 | 关闭该 patrol 的后续调度 | 先 `disarm_patrols` 再停机 |
+| 典型用户语义 | "先关自动回复/自动投递" | "服务下线/重启前停机" |
 
 ### 5.6 对话式控制面(ADR-004 §6.1, ✅ 已落地 2026-04-22)
 

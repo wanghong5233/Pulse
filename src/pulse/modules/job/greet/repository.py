@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from pulse.core.clock import local_today, local_today_start_utc, to_local
 from pulse.core.storage.engine import DatabaseEngine
 
 logger = logging.getLogger(__name__)
@@ -42,12 +43,7 @@ class GreetRepository:
     # ---------------------------------------------------------------- queries
 
     def today_greeted_urls(self) -> set[str]:
-        """今日(UTC) 成功打过招呼的 source_url 集合, 供 daily_limit 配额判断。
-
-        保留本方法是因为 daily_limit 的语义强绑定"当日", 与
-        ``all_greeted_urls`` 的跨天去重语义不同。DB 读失败会降级到
-        JSONL, 任一源的 IO 异常都转为空集合 — 避免瞬时抖动阻塞投递流程。
-        """
+        """成功 greet 列表, 仅当日; 用于 daily_limit 配额判断."""
         return self._greeted_urls(only_today=True)
 
     def all_greeted_urls(self) -> set[str]:
@@ -62,15 +58,16 @@ class GreetRepository:
         if self._engine is not None:
             try:
                 if only_today:
+                    start_utc = local_today_start_utc()
                     rows = self._engine.execute(
                         """
                         SELECT output_summary
                         FROM actions
                         WHERE action_type = 'greet'
                           AND status = 'greeted'
-                          AND created_at >= DATE_TRUNC('day', NOW() AT TIME ZONE 'UTC')
+                          AND created_at >= %s
                         """,
-                        (),
+                        (start_utc,),
                         fetch="all",
                     ) or []
                 else:
@@ -113,7 +110,7 @@ class GreetRepository:
         path = self._fallback_path
         if not path.is_file():
             return set()
-        today = datetime.now(timezone.utc).date().isoformat()
+        today_local = local_today()
         urls: set[str] = set()
         try:
             text = path.read_text(encoding="utf-8")
@@ -133,8 +130,16 @@ class GreetRepository:
             if str(item.get("status") or "").strip() != "greeted":
                 continue
             if only_today:
-                ts = str(item.get("greeted_at") or "")
-                if not ts.startswith(today):
+                ts_raw = str(item.get("greeted_at") or "").strip()
+                if not ts_raw:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if to_local(ts).date() != today_local:
                     continue
             url = str(item.get("source_url") or "").strip()
             if url:

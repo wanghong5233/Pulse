@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from datetime import datetime, timezone
 from typing import Any
 
 from .engine import ScheduleTask, SchedulerEngine
+
+logger = logging.getLogger(__name__)
 
 
 class BackgroundSchedulerRunner:
@@ -95,4 +98,5 @@ class BackgroundSchedulerRunner:
         try:
             asyncio.run(self.run_once())
         except Exception:
+            logger.exception("scheduler runner tick failed")
             return

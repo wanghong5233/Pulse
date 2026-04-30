@@ -16,9 +16,11 @@ Natural-language 解析已移除 — 所有用户意图由 Brain 通过 tool_use
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Callable
 
 from ..memory import (
+    HardConstraints,
     HARD_CONSTRAINT_FIELDS,
     MEMORY_ITEM_TYPES,
     JobMemory,
@@ -83,7 +85,18 @@ class JobProfileService:
             stage="set_hard_constraint", status="completed",
             trace_id=trace_id, payload={"field": field},
         )
-        return {"ok": True, "trace_id": trace_id, "field": field, "value": value}
+        hc = self._mem.get_hard_constraints()
+        effective_value = self._effective_hard_constraint_value(field=field, hc=hc)
+        return {
+            "ok": True,
+            "trace_id": trace_id,
+            "field": field,
+            "effective_value": effective_value,
+            "effective_value_human": self._format_hard_constraint_value(
+                field=field,
+                value=effective_value,
+            ),
+        }
 
     def unset_hard_constraint(
         self,
@@ -312,6 +325,58 @@ class JobProfileService:
             trace_id=trace_id, payload={"removed": removed},
         )
         return {"ok": True, "trace_id": trace_id, "removed": removed}
+
+    @staticmethod
+    def _effective_hard_constraint_value(
+        *, field: str, hc: HardConstraints
+    ) -> Any:
+        if field == "preferred_location":
+            return list(hc.preferred_location)
+        if field == "target_roles":
+            return list(hc.target_roles)
+        if field == "experience_level":
+            return hc.experience_level
+        if field == "salary_floor_monthly":
+            if hc.salary_floor_monthly is None:
+                return None
+            if hc.salary_floor_spec:
+                return {
+                    "value_monthly_k": hc.salary_floor_monthly,
+                    "source": dict(hc.salary_floor_spec),
+                }
+            return {"value_monthly_k": hc.salary_floor_monthly}
+        return None
+
+    @staticmethod
+    def _format_hard_constraint_value(*, field: str, value: Any) -> str:
+        if field in {"preferred_location", "target_roles"}:
+            if not isinstance(value, list):
+                return "(empty)"
+            items = [str(v).strip() for v in value if str(v).strip()]
+            return ", ".join(items) if items else "(empty)"
+        if field == "experience_level":
+            return str(value or "(empty)")
+        if field == "salary_floor_monthly":
+            if not isinstance(value, dict):
+                return "(empty)"
+            monthly_k = value.get("value_monthly_k")
+            if not isinstance(monthly_k, int) or isinstance(monthly_k, bool):
+                return "(empty)"
+            source = value.get("source")
+            if not isinstance(source, dict):
+                return f"{monthly_k} K/月"
+            amount = source.get("amount")
+            amount_text = str(amount)
+            if isinstance(amount, (int, float)) and not isinstance(amount, bool):
+                amount_text = str(int(amount)) if math.isclose(amount % 1, 0.0) else f"{amount:g}"
+            unit = str(source.get("unit") or "")
+            period = str(source.get("period") or "")
+            wd = source.get("work_days_per_month")
+            wd_tail = ""
+            if period == "day" and isinstance(wd, int) and wd > 0:
+                wd_tail = f" (work_days_per_month={wd})"
+            return f"{amount_text} {unit}/{period} (~{monthly_k} K/月){wd_tail}"
+        return str(value)
 
 
 # 重新导出, 供 module.py 暴露时用

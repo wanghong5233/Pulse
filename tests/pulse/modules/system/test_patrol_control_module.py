@@ -131,7 +131,7 @@ def test_enable_handler_default_only_flips_enabled(bound_module) -> None:
     assert out["name"] == "alpha"
     assert out["enabled"] is True
     assert out[ACTION_REPORT_KEY]["action"] == "system.patrol.enable"
-    assert out[ACTION_REPORT_KEY]["summary"] == "已开启后台任务 alpha"
+    assert out[ACTION_REPORT_KEY]["summary"] == "已开启后台任务 alpha（仅开启自动巡检）"
     assert rt.get_patrol_stats("alpha")["enabled"] is True
     assert executed == []
     assert rt.get_patrol_stats("alpha")["stats"].get("total_runs", 0) == 0
@@ -157,6 +157,7 @@ def test_enable_handler_with_trigger_now_runs_once(bound_module) -> None:
     assert out["name"] == "alpha"
     assert out["enabled"] is True
     assert out[ACTION_REPORT_KEY]["action"] == "system.patrol.enable"
+    assert out[ACTION_REPORT_KEY]["summary"] == "已开启后台任务 alpha，并立即触发一次执行"
     assert out[ACTION_REPORT_KEY]["details"][0]["extras"]["trigger_now"] is True
     assert out["first_run"]["ok"] is True
     assert out["first_run"]["last_outcome"] == "completed"
@@ -174,6 +175,10 @@ def test_disable_handler_flips_observable_state(bound_module) -> None:
     assert disable_out["name"] == "alpha"
     assert disable_out["enabled"] is False
     assert disable_out[ACTION_REPORT_KEY]["action"] == "system.patrol.disable"
+    assert (
+        disable_out[ACTION_REPORT_KEY]["summary"]
+        == "已关闭后台任务 alpha（仅关闭自动巡检，服务进程仍运行）"
+    )
     assert rt.get_patrol_stats("alpha")["enabled"] is False
 
 

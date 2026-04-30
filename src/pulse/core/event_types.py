@@ -68,6 +68,13 @@ class EventTypes:
     PREFERENCE_DOMAIN_REJECTED = "preference.domain.rejected"
     PREFERENCE_DOMAIN_ERROR = "preference.domain.error"
 
+    # ── job_greet 决策审计(per-JD verdict + reflection round) ──
+    # 高价值低频事件: 一次 trigger 触发一组 candidate 事件(每个进 matcher
+    # 的 JD 一条)和最多 _REFLECTION_MAX_ROUNDS 条 reflection 事件. 这两条
+    # 是回答"agent 为什么没投递成功"的唯一真相来源, 必须可回放.
+    MODULE_JOB_GREET_MATCH_CANDIDATE = "module.job_greet.match.candidate"
+    MODULE_JOB_GREET_TRIGGER_REFLECTION = "module.job_greet.trigger.reflection"
+
     # ── 治理平面(SafetyPlane, ⏳ 规划中; 常量预留, 现阶段不会被发射) ──
     # 实装时机: SafetyPlane 作为 EventBus 订阅者接入, 同时作为发射者回写决策.
     # 详见 ``docs/Pulse-内核架构总览.md`` §6.6.
@@ -95,6 +102,11 @@ _PERSISTED_PREFIXES: tuple[str, ...] = (
     # 每次 reflection 少则 0 条多则若干条, 必须可回放以便事后解释为什么
     # 某条偏好没有被持久化(低 confidence / applier 缺失 / Applier 报错).
     "preference.",
+    # job_greet 的 per-JD verdict 与 reflection 决策. module.* 默认不落盘
+    # (高频、可从 runtime 日志还原), 但这两条是 agent 反思链路的唯一真相
+    # 来源 — "为什么没投递" 在事后只能从这里复原, 必须可回放.
+    "module.job_greet.match.candidate",
+    "module.job_greet.trigger.reflection",
 )
 
 

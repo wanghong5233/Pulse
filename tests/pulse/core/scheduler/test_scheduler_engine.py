@@ -39,6 +39,29 @@ def test_scheduler_runs_due_task_with_interval() -> None:
     assert called == ["run", "run"]
 
 
+def test_scheduler_runs_due_async_handler() -> None:
+    called: list[str] = []
+    engine = SchedulerEngine()
+
+    async def _handler() -> None:
+        await asyncio.sleep(0)
+        called.append("run")
+
+    engine.register(
+        ScheduleTask(
+            name="job_async",
+            interval_seconds=60,
+            run_immediately=True,
+            handler=_handler,
+        )
+    )
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ran = asyncio.run(engine.run_pending(now=t0))
+    assert ran == ["job_async"]
+    assert called == ["run"]
+
+
 def test_set_enabled_stops_and_resumes_dispatch() -> None:
     """ADR-004 §6.1 decision A: flipping ``enabled`` in place must make the
     next ``run_pending`` tick skip the task, and flipping it back must

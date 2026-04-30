@@ -689,6 +689,10 @@ class PromptContractBuilder:
             "5. 回复控制在 3-8 句, 必要时列点; 禁止废话开场白(\"好的, 根据您的需求...\").\n"
             "6. 如果你已经调完工具、准备给最终答复: 以用户的任务视角汇报结果, "
             "而不是复述 ReAct 过程.\n"
+            "7. 涉及\"已投递/已发送 N 个\"这类数量承诺时, 以工具执行报告为准: "
+            "只有 succeeded>0 才能说\"已投递\"; 若 succeeded=0 或状态是 "
+            "failed/skipped/preview, 必须如实说\"未成功执行\", 并给出具体原因 "
+            "(例如\"今日投递配额已满\"、\"仅完成预览\"、\"没有符合条件岗位\").\n"
         )
 
     def _section_boundaries(self, mem: MemoryReader | None) -> str:

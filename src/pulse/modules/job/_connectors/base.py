@@ -84,12 +84,27 @@ class JobPlatformConnector(ABC):
         self,
         *,
         keyword: str,
-        max_items: int,
-        max_pages: int,
+        max_items: int | None = None,
+        max_pages: int | None = None,
+        target_count: int | None = None,
+        evaluation_cap: int | None = None,
+        scroll_plateau_rounds: int | None = None,
         job_type: str = "all",
         city: str | None = None,
     ) -> dict[str, Any]:
-        """Search jobs by keyword.
+        """Search jobs by keyword via streaming-scroll on the live result page.
+
+        Sizing parameters (preferred):
+          * ``target_count`` — early-stop threshold once enough cards collected.
+          * ``evaluation_cap`` — hard ceiling on total cards returned per call.
+          * ``scroll_plateau_rounds`` — # of consecutive empty scrolls before
+            declaring the source list exhausted.
+
+        Legacy ``max_items`` / ``max_pages`` are accepted for back-compat but
+        new callers should use the streaming knobs. Connectors over platforms
+        without true infinite-scroll (e.g. one-shot web search) MUST still
+        accept the new params and report ``exhausted=True`` so the business
+        layer's reflection logic can decide whether to evolve keywords.
 
         ``city`` (optional) is a human-readable city name (e.g. ``"杭州"``)
         that the connector SHOULD scope the search to when its backing
@@ -108,6 +123,13 @@ class JobPlatformConnector(ABC):
                 "snippet": str,
                 "source": str,          # provider_name
                 "collected_at": iso8601,
+            }
+
+        Returned envelope MUST also expose:
+
+            {
+                "exhausted": bool,       # source list truly out of new cards
+                "scroll_count": int,     # 0 for non-scrolling providers
             }
 
         The business layer relies on these fields and **must not** re-parse
